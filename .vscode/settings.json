@@ -1,0 +1,12 @@
+{
+  "java.configuration.updateBuildConfiguration": "interactive",
+  "kotlin.languageServer.enabled": true,
+  "kotlin.diagnostics.enabled": false,
+  "[kotlin]": {
+    "editor.defaultFormatter": "fwcd.kotlin",
+    "editor.formatOnSave": true
+  },
+  "terminal.integrated.env.windows": {
+    "DEBUG": null
+  }
+}

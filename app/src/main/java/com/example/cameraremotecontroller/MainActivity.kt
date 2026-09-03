@@ -1,5 +1,8 @@
 package com.example.cameraremotecontroller
 
+import android.content.Context
+import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -7,46 +10,54 @@ import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredHeight
+import androidx.compose.foundation.layout.requiredWidth
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -54,6 +65,7 @@ import com.example.cameraremotecontroller.ui.theme.CameraRemoteControllerTheme
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URI
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -63,8 +75,68 @@ import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
 
+// // PC Tunnel URLs (use when PC is bridging the connection)
+// private const val CAM1_URL = "rtsp://10.252.176.114:8554/main.264"
+// private const val CAM2_URL = "rtsp://10.252.176.114:8555/main.264"
+
+// Real Camera URLs (Uncomment and use when phone is directly on the camera network)
 private const val CAM1_URL = "rtsp://192.168.144.25:8554/main.264"
 private const val CAM2_URL = "rtsp://192.168.144.26:8554/main.264"
+
+/** One camera feed. [url] is null for an empty placeholder slot. */
+private data class CameraSource(val id: Int, val name: String, val url: String?)
+
+private val DEFAULT_CAMERAS =
+        listOf(
+                CameraSource(1, "CAM 1", CAM1_URL),
+                CameraSource(2, "CAM 2", CAM2_URL),
+        )
+
+private const val PREFS_NAME = "camera_remote_controller"
+private const val PREFS_KEY_CAMERAS = "cameras"
+
+/*
+ * Cameras are persisted as "name|url" records separated by newlines, so a
+ * camera added on the tablet survives a restart. Anything unparseable is
+ * skipped rather than crashing the dashboard.
+ */
+private fun SharedPreferences.loadCameras(): List<CameraSource> {
+    val raw = getString(PREFS_KEY_CAMERAS, null) ?: return DEFAULT_CAMERAS
+
+    val stored =
+            raw.lines().mapNotNull { line ->
+                val name = line.substringBefore('|', "").trim()
+                val url = line.substringAfter('|', "").trim()
+
+                if (name.isEmpty() || url.isEmpty()) null else name to url
+            }
+
+    if (stored.isEmpty()) return DEFAULT_CAMERAS
+
+    return stored.mapIndexed { index, (name, url) -> CameraSource(index + 1, name, url) }
+}
+
+private fun SharedPreferences.saveCameras(cameras: List<CameraSource>) {
+    val raw = cameras.filter { it.url != null }.joinToString("\n") { "${it.name}|${it.url}" }
+
+    edit().putString(PREFS_KEY_CAMERAS, raw).apply()
+}
+
+/** Accepts rtsp://host[:port][/path]; the host is the part users get wrong. */
+private fun normalizeRtspUrl(input: String): String? {
+    val trimmed = input.trim()
+    if (trimmed.isEmpty()) return null
+
+    val withScheme = if (trimmed.contains("://")) trimmed else "rtsp://$trimmed"
+    if (!withScheme.startsWith("rtsp://")) return null
+
+    return try {
+        val uri = URI(withScheme)
+        if (uri.host.isNullOrBlank()) null else withScheme
+    } catch (_: Exception) {
+        null
+    }
+}
 
 private val Background = Color(0xFF111216)
 private val HeaderBackground = Color(0xFF090A0D)
@@ -87,62 +159,315 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun ControllerDashboard() {
-    var primaryCamera by remember { mutableStateOf(1) }
-    val cam1RtspMs = rememberRtspResponseTime(CAM1_URL)
-    val cam2RtspMs = rememberRtspResponseTime(CAM2_URL)
-    val primaryName = if (primaryCamera == 1) "CAM 1" else "CAM 2 · REAR"
-    val primaryUrl = if (primaryCamera == 1) CAM1_URL else CAM2_URL
-    val secondaryName = if (primaryCamera == 1) "CAM 2 · REAR" else "CAM 1"
-    val secondaryUrl = if (primaryCamera == 1) CAM2_URL else CAM1_URL
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
+
+    val cameras = remember {
+        mutableStateListOf<CameraSource>().apply { addAll(prefs.loadCameras()) }
+    }
+
+    var primaryId by remember { mutableStateOf(cameras.firstOrNull()?.id ?: 0) }
+    var showSettings by remember { mutableStateOf(false) }
+
+    val primary = cameras.firstOrNull { it.id == primaryId } ?: cameras.firstOrNull()
+    val secondaries = cameras.filter { it.id != primary?.id }
 
     Surface(modifier = Modifier.fillMaxSize(), color = Background) {
-        BoxWithConstraints {
-            val compact = maxWidth < 900.dp || maxWidth < 550.dp
-            Column(modifier = Modifier.fillMaxSize()) {
-                StatusHeader(compact, cam1RtspMs, cam2RtspMs)
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (isLandscape) {
+
+                // ========================================
+                // LANDSCAPE
+                // Primary LEFT + secondaries stacked RIGHT
+                // ========================================
+
                 Row(modifier = Modifier.fillMaxSize()) {
                     CameraPanel(
-                            cameraName = primaryName,
+                            cameraName = primary?.name ?: "NO CAMERA",
                             modifier = Modifier.weight(1.9f).fillMaxHeight(),
-                            streamUrl = primaryUrl,
+                            streamUrl = primary?.url,
+                            rotation = 90,
                             onClick = {},
-                    ) {
-                        MovementControl(
-                                compact = compact,
-                                modifier =
-                                        Modifier.align(Alignment.BottomStart)
-                                                .padding(
-                                                        start = if (compact) 12.dp else 20.dp,
-                                                        bottom = if (compact) 10.dp else 18.dp,
-                                                ),
-                        )
-                    }
+                    )
+
                     Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                        CameraPanel(
-                                cameraName = secondaryName,
-                                modifier = Modifier.weight(1f).fillMaxWidth(),
-                                streamUrl = secondaryUrl,
-                                onClick = { primaryCamera = if (primaryCamera == 1) 2 else 1 },
-                        )
-                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(BorderColor))
-                        CameraPanel(
-                                cameraName = "CAM 3 · TOOL",
-                                modifier = Modifier.weight(1f).fillMaxWidth(),
-                                streamUrl = null,
-                                onClick = {},
-                        )
+                        if (secondaries.isEmpty()) {
+                            CameraPanel(
+                                    cameraName = "CAM 2",
+                                    modifier = Modifier.fillMaxSize(),
+                                    streamUrl = null,
+                                    onClick = {},
+                            )
+                        } else {
+                            secondaries.forEachIndexed { index, camera ->
+                                if (index > 0) {
+                                    Box(
+                                            modifier =
+                                                    Modifier.fillMaxWidth()
+                                                            .height(1.dp)
+                                                            .background(BorderColor)
+                                    )
+                                }
+
+                                DraggableCameraPanel(
+                                        camera = camera,
+                                        isLandscape = true,
+                                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                                        onClick = { primaryId = camera.id },
+                                )
+                            }
+                        }
+                    }
+                }
+            } else {
+
+                // ========================================
+                // PORTRAIT
+                // Primary TOP + secondaries in a row below
+                // ========================================
+
+                Column(modifier = Modifier.fillMaxSize()) {
+                    CameraPanel(
+                            cameraName = primary?.name ?: "NO CAMERA",
+                            modifier = Modifier.weight(1.5f).fillMaxWidth(),
+                            streamUrl = primary?.url,
+                            rotation = 90,
+                            onClick = {},
+                    )
+
+                    Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                        if (secondaries.isEmpty()) {
+                            CameraPanel(
+                                    cameraName = "CAM 2",
+                                    modifier = Modifier.fillMaxSize(),
+                                    streamUrl = null,
+                                    onClick = {},
+                            )
+                        } else {
+                            secondaries.forEachIndexed { index, camera ->
+                                if (index > 0) {
+                                    Box(
+                                            modifier =
+                                                    Modifier.fillMaxHeight()
+                                                            .width(1.dp)
+                                                            .background(BorderColor)
+                                    )
+                                }
+
+                                DraggableCameraPanel(
+                                        camera = camera,
+                                        isLandscape = false,
+                                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                                        onClick = { primaryId = camera.id },
+                                )
+                            }
+                        }
                     }
                 }
             }
+
+            SettingsButton(
+                    modifier = Modifier.align(Alignment.TopEnd).padding(11.dp),
+                    onClick = { showSettings = true },
+            )
         }
+    }
+
+    if (showSettings) {
+        CameraSettingsDialog(
+                cameras = cameras,
+                onDismiss = { showSettings = false },
+                onAdd = { name, url ->
+                    val id = (cameras.maxOfOrNull { it.id } ?: 0) + 1
+                    cameras.add(CameraSource(id, name, url))
+                    prefs.saveCameras(cameras)
+                },
+                onRemove = { camera ->
+                    cameras.remove(camera)
+                    prefs.saveCameras(cameras)
+
+                    // Removing the feed on screen promotes whatever is left.
+                    if (primaryId == camera.id) primaryId = cameras.firstOrNull()?.id ?: 0
+                },
+        )
+    }
+}
+
+/**
+ * A secondary feed. Long-press and drag repositions it; a plain tap still
+ * promotes it into the primary panel.
+ */
+@Composable
+private fun DraggableCameraPanel(
+        camera: CameraSource,
+        isLandscape: Boolean,
+        modifier: Modifier,
+        onClick: () -> Unit,
+) {
+    var offsetX by remember(camera.id) { mutableStateOf(0f) }
+    var offsetY by remember(camera.id) { mutableStateOf(0f) }
+    var dragging by remember(camera.id) { mutableStateOf(false) }
+
+    /*
+     * Snap back to the slot on a flip, so a panel dragged in landscape does
+     * not reappear displaced in portrait. This is an effect rather than a
+     * remember() key on purpose: keying the state on the orientation also
+     * tore down the gesture detector below during the rotation
+     * recomposition, which left the panel undraggable in portrait.
+     */
+    LaunchedEffect(isLandscape) {
+        offsetX = 0f
+        offsetY = 0f
+        dragging = false
+    }
+
+    CameraPanel(
+            cameraName = camera.name,
+            modifier =
+                    modifier.offset { IntOffset(offsetX.roundToInt(), offsetY.roundToInt()) }
+                            // A dragged panel floats above its neighbours.
+                            .zIndex(if (dragging) 1f else 0f)
+                            .pointerInput(camera.id) {
+                                detectDragGesturesAfterLongPress(
+                                        onDragStart = { dragging = true },
+                                        onDragEnd = { dragging = false },
+                                        onDragCancel = { dragging = false },
+                                        onDrag = { change, dragAmount ->
+                                            change.consume()
+                                            offsetX += dragAmount.x
+                                            offsetY += dragAmount.y
+                                        },
+                                )
+                            },
+            streamUrl = camera.url,
+            rotation = 90,
+            onClick = onClick,
+    )
+}
+
+@Composable
+private fun SettingsButton(modifier: Modifier, onClick: () -> Unit) {
+    Box(
+            modifier =
+                    modifier.size(28.dp)
+                            .background(color = HeaderBackground, shape = CircleShape)
+                            .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center,
+    ) {
+        Text("⚙", color = MutedText, fontSize = 14.sp)
     }
 }
 
 @Composable
-private fun rememberRtspResponseTime(streamUrl: String): Long? {
+private fun CameraSettingsDialog(
+        cameras: List<CameraSource>,
+        onDismiss: () -> Unit,
+        onAdd: (String, String) -> Unit,
+        onRemove: (CameraSource) -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    var url by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                Text(
+                        "CAMERAS",
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    cameras.forEach { camera ->
+                        Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                        camera.name,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        fontFamily = FontFamily.Monospace,
+                                )
+                                Text(
+                                        camera.url ?: "-",
+                                        color = MutedText,
+                                        fontSize = 10.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                )
+                            }
+
+                            TextButton(onClick = { onRemove(camera) }) {
+                                Text("REMOVE", color = Red, fontSize = 10.sp)
+                            }
+                        }
+                    }
+
+                    OutlinedTextField(
+                            value = name,
+                            onValueChange = { name = it },
+                            label = { Text("NAME", fontSize = 11.sp) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                    )
+
+                    OutlinedTextField(
+                            value = url,
+                            onValueChange = { url = it },
+                            label = { Text("RTSP URL OR IP", fontSize = 11.sp) },
+                            placeholder = {
+                                Text("192.168.144.27:8554/main.264", fontSize = 11.sp)
+                            },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                    )
+
+                    error?.let {
+                        Text(it, color = Red, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                        onClick = {
+                            val normalized = normalizeRtspUrl(url)
+
+                            if (normalized == null) {
+                                error = "ENTER A VALID RTSP ADDRESS"
+                            } else {
+                                val label = name.trim().ifEmpty { "CAM ${cameras.size + 1}" }
+
+                                onAdd(label, normalized)
+                                name = ""
+                                url = ""
+                                error = null
+                            }
+                        }
+                ) {
+                    Text("ADD CAMERA")
+                }
+            },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("CLOSE") } },
+    )
+}
+
+@Composable
+private fun rememberRtspResponseTime(streamUrl: String?): Long? {
     var responseMs by remember(streamUrl) { mutableStateOf<Long?>(null) }
 
     LaunchedEffect(streamUrl) {
+        if (streamUrl == null) {
+            responseMs = null
+            return@LaunchedEffect
+        }
+
         val uri = URI(streamUrl)
         val port = if (uri.port >= 0) uri.port else 554
         val socketAddress =
@@ -194,68 +519,6 @@ private fun measureRtspResponseTime(streamUrl: String, socketAddress: InetSocket
 }
 
 @Composable
-private fun StatusHeader(compact: Boolean, cam1ConnectMs: Long?, cam2ConnectMs: Long?) {
-    val smallText = if (compact) 9.sp else 11.sp
-    val cam1Text = cam1ConnectMs?.let { "$it ms" } ?: "--"
-    val cam2Text = cam2ConnectMs?.let { "$it ms" } ?: "--"
-
-    Row(
-            modifier =
-                    Modifier.fillMaxWidth()
-                            .height(if (compact) 40.dp else 48.dp)
-                            .background(HeaderBackground)
-                            .border(1.dp, BorderColor),
-            verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Row(
-                modifier = Modifier.weight(1f).padding(start = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(7.dp),
-        ) {
-            StatusDot(online = false)
-            HeaderText("UDP NOT LINKED", smallText)
-            Spacer(modifier = Modifier.weight(1f))
-            HeaderText("CAMS", smallText)
-            StatusDot(online = cam1ConnectMs != null)
-            StatusDot(online = cam2ConnectMs != null)
-            StatusDot(online = false)
-        }
-        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            Text(
-                    text = "RTSP · C1 $cam1Text · C2 $cam2Text",
-                    color = Color.White,
-                    fontSize = if (compact) 9.sp else 12.sp,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace,
-            )
-        }
-        Box(
-                modifier = Modifier.weight(1f).padding(end = 7.dp),
-                contentAlignment = Alignment.CenterEnd,
-        ) {
-            Button(
-                    onClick = { /* E-Stop transport will be connected later. */},
-                    modifier =
-                            Modifier.width(if (compact) 92.dp else 126.dp)
-                                    .fillMaxHeight()
-                                    .padding(vertical = 4.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Red),
-                    shape = RoundedCornerShape(8.dp),
-                    contentPadding = PaddingValues(horizontal = 8.dp),
-            ) {
-                Text(
-                        "E-STOP",
-                        color = Color.White,
-                        fontSize = smallText,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun HeaderText(text: String, fontSize: androidx.compose.ui.unit.TextUnit) {
     Text(
             text,
@@ -269,11 +532,12 @@ private fun HeaderText(text: String, fontSize: androidx.compose.ui.unit.TextUnit
 @Composable
 private fun StatusDot(online: Boolean = true) {
     Box(
-        modifier =
-            Modifier.size(7.dp).background(
-                color = if (online) Green else Red,
-                shape = CircleShape,
-            ),
+            modifier =
+                    Modifier.size(7.dp)
+                            .background(
+                                    color = if (online) Green else Red,
+                                    shape = CircleShape,
+                            ),
     )
 }
 
@@ -282,18 +546,36 @@ private fun CameraPanel(
         cameraName: String,
         modifier: Modifier,
         streamUrl: String?,
+        rotation: Int = 0,
         onClick: () -> Unit,
         content: @Composable BoxScope.() -> Unit = {},
 ) {
-    Box(
-            modifier =
-                    modifier.background(Background)
-                            .border(0.5.dp, BorderColor)
-                            .clickable(onClick = onClick)
-    ) {
+    val latencyMs = rememberRtspResponseTime(streamUrl)
+
+    // The RTSP probe below polls every few seconds, so it is the liveness signal.
+    val online = streamUrl != null && latencyMs != null
+
+    /*
+     * An unreachable camera keeps its slot rather than collapsing the grid,
+     * but VLC will not recover a stream that died under it. Bumping this
+     * generation rebuilds the player once the probe sees the camera again.
+     * wasOnline starts true so the very first successful probe does not
+     * pointlessly restart a player that is already running.
+     */
+    var streamGeneration by remember(streamUrl) { mutableStateOf(0) }
+    var wasOnline by remember(streamUrl) { mutableStateOf(true) }
+
+    LaunchedEffect(online) {
+        if (online && !wasOnline) streamGeneration++
+        wasOnline = online
+    }
+
+    Box(modifier = modifier.background(Background).clickable(onClick = onClick)) {
         if (streamUrl != null) {
             // Give each stream its own VLC lifecycle when cameras swap positions.
-            key(streamUrl) { RtspCameraPreview(streamUrl = streamUrl) }
+            key(streamUrl, streamGeneration) {
+                RtspCameraPreview(streamUrl = streamUrl, rotation = rotation)
+            }
         } else {
             Text(
                     "NO CAMERA",
@@ -304,12 +586,28 @@ private fun CameraPanel(
             )
         }
 
+        if (streamUrl != null && !online) {
+            // Covers the stale last frame so an offline feed cannot be mistaken for a live one.
+            Box(
+                    modifier = Modifier.fillMaxSize().background(Background.copy(alpha = 0.82f)),
+                    contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                        "OFFLINE",
+                        color = Red,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                )
+            }
+        }
+
         Row(
                 modifier = Modifier.align(Alignment.TopStart).padding(11.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(7.dp),
         ) {
-            StatusDot()
+            StatusDot(online = online)
             Text(
                     cameraName,
                     color = Color.White,
@@ -317,45 +615,139 @@ private fun CameraPanel(
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace,
             )
+            if (latencyMs != null) {
+                Text(
+                        "· ${latencyMs}ms",
+                        color = MutedText,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                )
+            }
         }
         content()
     }
 }
 
 @Composable
-private fun RtspCameraPreview(streamUrl: String) {
+private fun RtspCameraPreview(streamUrl: String, rotation: Int = 0) {
     val context = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
-    var errorMessage by remember(streamUrl) { mutableStateOf<String?>(null) }
-    val libVlc = remember {
-        LibVLC(
-                context,
-                arrayListOf(
-                        "--rtsp-tcp",
-                        "--avcodec-hw=none",
-                        "--network-caching=100",
-                        "--no-audio",
-                ),
-        )
-    }
-    val mediaPlayer = remember { MediaPlayer(libVlc) }
 
-    DisposableEffect(streamUrl) {
+    var errorMessage by remember(streamUrl) { mutableStateOf<String?>(null) }
+
+    var isPlaying by remember(streamUrl) { mutableStateOf(false) }
+
+    /*
+     * Displayed aspect ratio (width / height) of the decoded video,
+     * already accounting for the transform filter's rotation.
+     * Null until VLC reports the first frame.
+     */
+    var videoAspect by
+            remember(streamUrl, rotation) {
+                /*
+                 * Seeded with the cameras' native 16:9 (rotated when the
+                 * transform filter is on) so there is never a frame where
+                 * the size is unknown -- an unknown size used to fall back
+                 * to VLC's own letterboxed scaling, and which camera lost
+                 * that race varied run to run. Corrected below if a stream
+                 * ever reports something else.
+                 */
+                mutableStateOf(if (rotation == 90 || rotation == 270) 9f / 16f else 16f / 9f)
+            }
+
+    /*
+     * IMPORTANT:
+     * Rotate inside VLC.
+     *
+     * Do NOT rotate VLCVideoLayout with Compose graphicsLayer.
+     */
+    val libVlc =
+            remember(streamUrl, rotation) {
+                val options =
+                        arrayListOf(
+                                "--rtsp-tcp",
+                                "--avcodec-hw=none",
+                                "--network-caching=300",
+                                "--no-audio"
+                        )
+
+                if (rotation == 90 || rotation == 180 || rotation == 270) {
+                    options.add("--video-filter=transform")
+                    options.add("--transform-type=$rotation")
+                }
+
+                LibVLC(context, options)
+            }
+
+    val mediaPlayer = remember(streamUrl, rotation) { MediaPlayer(libVlc) }
+
+    DisposableEffect(streamUrl, rotation) {
         mediaPlayer.setEventListener { event ->
-            if (event.type == MediaPlayer.Event.EncounteredError) {
-                mainHandler.post { errorMessage = "RTSP STREAM ERROR" }
+            when (event.type) {
+                MediaPlayer.Event.Playing -> {
+                    mainHandler.post { isPlaying = true }
+                }
+                MediaPlayer.Event.Vout -> {
+
+                    /*
+                     * Recalculate the video surface after VLC
+                     * knows the real stream dimensions.
+                     */
+                    mainHandler.post {
+                        val track = mediaPlayer.currentVideoTrack
+
+                        if (track != null && track.width > 0 && track.height > 0) {
+                            val sourceAspect = track.width.toFloat() / track.height.toFloat()
+
+                            videoAspect =
+                                    if (rotation == 90 || rotation == 270) 1f / sourceAspect
+                                    else sourceAspect
+                        }
+
+
+                        /*
+                         * SURFACE_FILL stretches the video to the layout.
+                         * That is safe here because we give the layout the
+                         * correct aspect ratio ourselves (see videoAspect
+                         * below), so nothing is actually distorted.
+                         */
+                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FILL)
+
+                        mediaPlayer.updateVideoSurfaces()
+                    }
+                }
+                MediaPlayer.Event.EncounteredError -> {
+                    mainHandler.post { errorMessage = "RTSP STREAM ERROR" }
+                }
+                MediaPlayer.Event.Buffering -> {
+                    if (event.buffering >= 100f) {
+                        mainHandler.post { isPlaying = true }
+                    }
+                }
             }
         }
 
         val media =
                 Media(libVlc, Uri.parse(streamUrl)).apply {
                     setHWDecoderEnabled(false, false)
+
                     addOption(":rtsp-tcp")
-                    addOption(":network-caching=100")
+                    addOption(":network-caching=300")
                     addOption(":no-audio")
                 }
+
         mediaPlayer.media = media
         media.release()
+
+        /*
+         * THIS is what makes the video behave like
+         * ContentScale.Crop.
+         *
+         * It preserves aspect ratio and lets VLC crop
+         * the excess to cover the panel.
+         */
+        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN)
+
         mediaPlayer.play()
 
         onDispose {
@@ -366,35 +758,80 @@ private fun RtspCameraPreview(streamUrl: String) {
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+    BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().background(Color.Black).clipToBounds(),
+            contentAlignment = Alignment.Center
+    ) {
+        /*
+         * Cover, not contain: scale the video layout up until it fills
+         * the panel on both axes and let clipToBounds() crop the excess.
+         * Letting VLC scale it only ever produced letterboxing, because
+         * the rotated 720x1280 frame does not match the panel shape.
+         */
+        val panelAspect = maxWidth / maxHeight
+
+        /*
+         * requiredWidth/requiredHeight, NOT width/height: the plain
+         * modifiers are coerced by the parent's constraints, which clamped
+         * the overflowing axis back to the panel and defeated the whole
+         * point of covering. The required* variants ignore the incoming
+         * constraints, and clipToBounds() above crops the excess.
+         */
+        val videoModifier =
+                if (videoAspect > panelAspect) {
+                    // Video is wider than the panel: match height, overflow width.
+                    Modifier.requiredHeight(maxHeight).requiredWidth(maxHeight * videoAspect)
+                } else {
+                    // Video is taller than the panel: match width, overflow height.
+                    Modifier.requiredWidth(maxWidth).requiredHeight(maxWidth / videoAspect)
+                }
+
         AndroidView(
                 factory = { ctx ->
                     VLCVideoLayout(ctx).also { layout ->
+
+                        /*
+                         * false = no subtitles
+                         * false = SurfaceView instead of TextureView
+                         */
                         mediaPlayer.attachViews(layout, null, false, false)
                     }
                 },
-                modifier = Modifier.fillMaxSize(),
+                /*
+                 * The layout changes size on rotation and whenever the
+                 * cover calculation above changes. VLC does not notice on
+                 * its own, so push the new bounds into it.
+                 */
+                modifier =
+                        videoModifier.onSizeChanged { size ->
+                            if (size.width > 0 && size.height > 0) {
+                                mainHandler.post { mediaPlayer.updateVideoSurfaces() }
+                            }
+                        }
         )
-        errorMessage?.let {
+
+        if (!isPlaying && errorMessage == null) {
             Text(
-                    it,
-                    color = Red,
+                    text = "CONNECTING...",
+                    color = Color.White.copy(alpha = 0.5f),
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.align(Alignment.Center),
+                    modifier = Modifier.align(Alignment.Center)
+            )
+        }
+
+        errorMessage?.let { message ->
+            Text(
+                    text = message,
+                    color = Red,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    modifier =
+                            Modifier.align(Alignment.Center)
+                                    .background(Color.Black.copy(alpha = 0.5f))
+                                    .padding(4.dp)
             )
         }
     }
-}
-
-@Composable
-private fun MovementControl(compact: Boolean, modifier: Modifier = Modifier) {
-    Text(
-            "MOVEMENT",
-            modifier = modifier,
-            color = Color.White,
-            fontSize = if (compact) 9.sp else 11.sp,
-            fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.Monospace,
-    )
 }

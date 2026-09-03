@@ -18,7 +18,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.cameraremotecontroller"
-        minSdk = 30
+        minSdk = 29
         targetSdk = 37
         versionCode = 1
         versionName = "1.0"

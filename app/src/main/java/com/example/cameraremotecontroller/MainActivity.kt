@@ -3,37 +3,49 @@ package com.example.cameraremotecontroller
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.res.Configuration
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.AnimationSpec
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredHeight
 import androidx.compose.foundation.layout.requiredWidth
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -45,15 +57,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -62,11 +76,14 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.cameraremotecontroller.ui.theme.CameraRemoteControllerTheme
+import java.io.BufferedReader
+import java.io.BufferedWriter
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URI
-import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -83,8 +100,12 @@ import org.videolan.libvlc.util.VLCVideoLayout
 private const val CAM1_URL = "rtsp://192.168.144.25:8554/main.264"
 private const val CAM2_URL = "rtsp://192.168.144.26:8554/main.264"
 
-/** One camera feed. [url] is null for an empty placeholder slot. */
-private data class CameraSource(val id: Int, val name: String, val url: String?)
+private data class CameraSource(
+        val id: Int,
+        val name: String,
+        val url: String?,
+        val rotation: Int = 90,
+)
 
 private val DEFAULT_CAMERAS =
         listOf(
@@ -95,34 +116,35 @@ private val DEFAULT_CAMERAS =
 private const val PREFS_NAME = "camera_remote_controller"
 private const val PREFS_KEY_CAMERAS = "cameras"
 
-/*
- * Cameras are persisted as "name|url" records separated by newlines, so a
- * camera added on the tablet survives a restart. Anything unparseable is
- * skipped rather than crashing the dashboard.
- */
 private fun SharedPreferences.loadCameras(): List<CameraSource> {
     val raw = getString(PREFS_KEY_CAMERAS, null) ?: return DEFAULT_CAMERAS
 
     val stored =
             raw.lines().mapNotNull { line ->
-                val name = line.substringBefore('|', "").trim()
-                val url = line.substringAfter('|', "").trim()
+                val parts = line.split('|')
+                val name = parts.getOrNull(0)?.trim().orEmpty()
+                val url = parts.getOrNull(1)?.trim().orEmpty()
+                val rotation = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 90
 
-                if (name.isEmpty() || url.isEmpty()) null else name to url
+                if (name.isEmpty() || url.isEmpty()) null else Triple(name, url, rotation)
             }
 
     if (stored.isEmpty()) return DEFAULT_CAMERAS
 
-    return stored.mapIndexed { index, (name, url) -> CameraSource(index + 1, name, url) }
+    return stored.mapIndexed { index, (name, url, rotation) ->
+        CameraSource(index + 1, name, url, rotation)
+    }
 }
 
 private fun SharedPreferences.saveCameras(cameras: List<CameraSource>) {
-    val raw = cameras.filter { it.url != null }.joinToString("\n") { "${it.name}|${it.url}" }
+    val raw =
+            cameras.filter { it.url != null }.joinToString("\n") {
+                "${it.name}|${it.url}|${it.rotation}"
+            }
 
     edit().putString(PREFS_KEY_CAMERAS, raw).apply()
 }
 
-/** Accepts rtsp://host[:port][/path]; the host is the part users get wrong. */
 private fun normalizeRtspUrl(input: String): String? {
     val trimmed = input.trim()
     if (trimmed.isEmpty()) return null
@@ -145,15 +167,86 @@ private val Green = Color(0xFF3EDC81)
 private val Red = Color(0xFFF34F55)
 private val MutedText = Color(0xFF8296A8)
 
+private const val CODEC_TAG = "CodecProbe"
+
+private const val H264_MIME = "video/avc"
+
+private fun logH264DecoderCapabilities() {
+    val codecs =
+            try {
+                MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+            } catch (e: Exception) {
+                Log.w(CODEC_TAG, "codec list unavailable", e)
+                return
+            }
+
+    val decoders =
+            codecs.filter { info ->
+                !info.isEncoder && info.supportedTypes.any { it.equals(H264_MIME, true) }
+            }
+
+    if (decoders.isEmpty()) {
+        Log.w(CODEC_TAG, "no $H264_MIME decoder on this device")
+        return
+    }
+
+    Log.i(CODEC_TAG, "api=${Build.VERSION.SDK_INT} device=${Build.MANUFACTURER} ${Build.MODEL}")
+
+    decoders.forEach { info ->
+        val lowLatency =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    try {
+                        info.getCapabilitiesForType(H264_MIME)
+                                .isFeatureSupported(
+                                        MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency,
+                                )
+                                .toString()
+                    } catch (_: Exception) {
+                        "error"
+                    }
+                } else {
+                    "needs-api-30"
+                }
+
+        Log.i(
+                CODEC_TAG,
+                "${info.name} hardware=${info.isHardwareAccelerated} " +
+                        "vendor=${info.isVendor} lowLatency=$lowLatency",
+        )
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        logH264DecoderCapabilities()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
         setContent { CameraRemoteControllerTheme { ControllerDashboard() } }
+    }
+}
+
+@Composable
+private fun KeepWifiLowLatency() {
+    val context = LocalContext.current
+
+    DisposableEffect(Unit) {
+        val wifiManager =
+                context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+
+        val lock =
+                wifiManager.createWifiLock(
+                        WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                        "camera-remote-controller:stream",
+                )
+
+        lock.setReferenceCounted(false)
+        lock.acquire()
+
+        onDispose { if (lock.isHeld) lock.release() }
     }
 }
 
@@ -165,6 +258,8 @@ fun ControllerDashboard() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
 
+    KeepWifiLowLatency()
+
     val cameras = remember {
         mutableStateListOf<CameraSource>().apply { addAll(prefs.loadCameras()) }
     }
@@ -172,105 +267,212 @@ fun ControllerDashboard() {
     var primaryId by remember { mutableStateOf(cameras.firstOrNull()?.id ?: 0) }
     var showSettings by remember { mutableStateOf(false) }
 
-    val primary = cameras.firstOrNull { it.id == primaryId } ?: cameras.firstOrNull()
-    val secondaries = cameras.filter { it.id != primary?.id }
+    var floatingId by remember { mutableStateOf<Int?>(null) }
+    var stowedLeft by remember { mutableStateOf<Boolean?>(null) }
+    var floatX by remember { mutableStateOf(0f) }
+    var floatY by remember { mutableStateOf(0f) }
+    var dragging by remember { mutableStateOf(false) }
+    var floatWasMain by remember { mutableStateOf(false) }
+
+    val floating = cameras.firstOrNull { it.id == floatingId }
+    val split = cameras.filter { it.id != floating?.id }
+    val main = split.firstOrNull { it.id == primaryId } ?: split.firstOrNull()
+    val docked = split.filter { it.id != main?.id }
+
+    LaunchedEffect(cameras.size) {
+        if (cameras.none { it.id == floatingId }) {
+            floatingId = null
+            stowedLeft = null
+        }
+    }
 
     Surface(modifier = Modifier.fillMaxSize(), color = Background) {
-        Box(modifier = Modifier.fillMaxSize()) {
-            if (isLandscape) {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize().clipToBounds()) {
+            val screenW = maxWidth
+            val screenH = maxHeight
+            val margin = 12.dp
 
-                // ========================================
-                // LANDSCAPE
-                // Primary LEFT + secondaries stacked RIGHT
-                // ========================================
+            val floatW = minOf(screenW, screenH) * 0.32f
+            val floatH = minOf(floatW * 16f / 9f, screenH * 0.8f)
+            val canFloat = cameras.size >= 2
+            val showPlaceholder = cameras.size < 2
+            val splitCount = if (showPlaceholder) 1 else docked.size
 
-                Row(modifier = Modifier.fillMaxSize()) {
-                    CameraPanel(
-                            cameraName = primary?.name ?: "NO CAMERA",
-                            modifier = Modifier.weight(1.9f).fillMaxHeight(),
-                            streamUrl = primary?.url,
-                            rotation = 90,
-                            onClick = {},
-                    )
-
-                    Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                        if (secondaries.isEmpty()) {
-                            CameraPanel(
-                                    cameraName = "CAM 2",
-                                    modifier = Modifier.fillMaxSize(),
-                                    streamUrl = null,
-                                    onClick = {},
-                            )
-                        } else {
-                            secondaries.forEachIndexed { index, camera ->
-                                if (index > 0) {
-                                    Box(
-                                            modifier =
-                                                    Modifier.fillMaxWidth()
-                                                            .height(1.dp)
-                                                            .background(BorderColor)
-                                    )
-                                }
-
-                                DraggableCameraPanel(
-                                        camera = camera,
-                                        isLandscape = true,
-                                        modifier = Modifier.weight(1f).fillMaxWidth(),
-                                        onClick = { primaryId = camera.id },
-                                )
-                            }
-                        }
+            val mainBounds =
+                    when {
+                        splitCount == 0 -> PaneBounds(0.dp, 0.dp, screenW, screenH)
+                        isLandscape -> PaneBounds(0.dp, 0.dp, screenW * (1.9f / 2.9f), screenH)
+                        else -> PaneBounds(0.dp, 0.dp, screenW, screenH * (1.5f / 2.5f))
                     }
+
+            fun dockedBounds(index: Int): PaneBounds {
+                val slot = index.coerceAtLeast(0)
+                return if (isLandscape) {
+                    val h = screenH / splitCount
+                    PaneBounds(mainBounds.w, h * slot, screenW - mainBounds.w, h)
+                } else {
+                    val w = screenW / splitCount
+                    PaneBounds(w * slot, mainBounds.h, w, screenH - mainBounds.h)
                 }
-            } else {
+            }
 
-                // ========================================
-                // PORTRAIT
-                // Primary TOP + secondaries in a row below
-                // ========================================
-
-                Column(modifier = Modifier.fillMaxSize()) {
-                    CameraPanel(
-                            cameraName = primary?.name ?: "NO CAMERA",
-                            modifier = Modifier.weight(1.5f).fillMaxWidth(),
-                            streamUrl = primary?.url,
-                            rotation = 90,
-                            onClick = {},
+            val floatBounds =
+                    PaneBounds(
+                            x =
+                                    when (stowedLeft) {
+                                        true -> margin - floatW
+                                        false -> screenW - margin
+                                        null -> floatX.dp
+                                    },
+                            y = floatY.dp,
+                            w = floatW,
+                            h = floatH,
                     )
 
-                    Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                        if (secondaries.isEmpty()) {
-                            CameraPanel(
-                                    cameraName = "CAM 2",
-                                    modifier = Modifier.fillMaxSize(),
-                                    streamUrl = null,
-                                    onClick = {},
-                            )
-                        } else {
-                            secondaries.forEachIndexed { index, camera ->
-                                if (index > 0) {
-                                    Box(
-                                            modifier =
-                                                    Modifier.fillMaxHeight()
-                                                            .width(1.dp)
-                                                            .background(BorderColor)
-                                    )
-                                }
-
-                                DraggableCameraPanel(
-                                        camera = camera,
-                                        isLandscape = false,
-                                        modifier = Modifier.weight(1f).fillMaxHeight(),
-                                        onClick = { primaryId = camera.id },
+            fun settleFloat() {
+                dragging = false
+                val edgeSlack = floatW.value * 0.5f
+                when {
+                    floatX < -edgeSlack -> stowedLeft = true
+                    floatX > screenW.value - edgeSlack -> stowedLeft = false
+                    else -> {
+                        stowedLeft = null
+                        floatX =
+                                if (floatX + floatW.value / 2f < screenW.value / 2f) margin.value
+                                else screenW.value - floatW.value - margin.value
+                        floatY =
+                                floatY.coerceIn(
+                                        margin.value,
+                                        (screenH.value - floatH.value - margin.value).coerceAtLeast(
+                                                margin.value
+                                        ),
                                 )
-                            }
-                        }
                     }
                 }
             }
 
+            fun dock() {
+                if (floatWasMain) floatingId?.let { primaryId = it }
+                floatingId = null
+                stowedLeft = null
+                floatWasMain = false
+            }
+
+            cameras.forEach { cam ->
+                key(cam.id) {
+                    val isFloat = cam.id == floatingId
+                    val isMain = !isFloat && cam.id == main?.id
+
+                    val bounds =
+                            when {
+                                isFloat -> floatBounds
+                                isMain -> mainBounds
+                                else -> dockedBounds(docked.indexOfFirst { it.id == cam.id })
+                            }
+
+                    val gestures =
+                            if (isFloat) {
+                                Modifier.pointerInput(cam.id) {
+                                    detectDragGestures(
+                                            onDragStart = { dragging = true },
+                                            onDragEnd = { settleFloat() },
+                                            onDragCancel = { settleFloat() },
+                                            onDrag = { change, amount ->
+                                                change.consume()
+                                                floatX += amount.x.toDp().value
+                                                floatY += amount.y.toDp().value
+                                            },
+                                    )
+                                }
+                            } else if (canFloat) {
+                                Modifier.pointerInput(cam.id, isMain) {
+                                    detectDragGesturesAfterLongPress(
+                                            onDragStart = { touch ->
+                                                floatX =
+                                                        bounds.x.value + touch.x.toDp().value -
+                                                                floatW.value / 2f
+                                                floatY =
+                                                        bounds.y.value + touch.y.toDp().value -
+                                                                floatH.value / 2f
+                                                stowedLeft = null
+                                                floatWasMain = isMain
+                                                if (isMain) {
+                                                    docked.firstOrNull()?.let { primaryId = it.id }
+                                                }
+
+                                                floatingId = cam.id
+                                                dragging = true
+                                            },
+                                            onDragEnd = { settleFloat() },
+                                            onDragCancel = { settleFloat() },
+                                            onDrag = { change, amount ->
+                                                change.consume()
+                                                floatX += amount.x.toDp().value
+                                                floatY += amount.y.toDp().value
+                                            },
+                                    )
+                                }
+                            } else Modifier
+
+                    val floatSkin =
+                            if (isFloat)
+                                    Modifier.clip(RoundedCornerShape(8.dp))
+                                            .border(1.dp, BorderColor, RoundedCornerShape(8.dp))
+                            else Modifier
+
+                    CameraPanel(
+                            cameraName = cam.name,
+                            modifier =
+                                    paneModifier(bounds, animate = !(isFloat && dragging))
+                                            .zIndex(if (isFloat) 2f else 0f)
+                                            .then(floatSkin)
+                                            .then(gestures),
+                            streamUrl = cam.url,
+                            rotation = cam.rotation,
+                            onClick = {
+                                when {
+                                    isFloat -> dock()
+                                    !isMain -> primaryId = cam.id
+                                }
+                            },
+                    )
+                }
+            }
+
+            if (showPlaceholder) {
+                CameraPanel(
+                        cameraName = "CAM 2",
+                        modifier = paneModifier(dockedBounds(0), animate = true),
+                        streamUrl = null,
+                        onClick = {},
+                )
+            }
+
+            stowedLeft?.let { left ->
+                StowPill(
+                        modifier =
+                                Modifier.offset(
+                                                x = if (left) 0.dp else screenW - 15.dp,
+                                                y =
+                                                        (floatY.dp + floatH / 2f - 27.dp).coerceIn(
+                                                                margin,
+                                                                (screenH - 54.dp - margin)
+                                                                        .coerceAtLeast(margin),
+                                                        ),
+                                        )
+                                        .zIndex(3f),
+                        left = left,
+                        onClick = {
+                            stowedLeft = null
+                            floatX =
+                                    if (left) margin.value
+                                    else screenW.value - floatW.value - margin.value
+                        },
+                )
+            }
+
             SettingsButton(
-                    modifier = Modifier.align(Alignment.TopEnd).padding(11.dp),
+                    modifier = Modifier.align(Alignment.TopEnd).padding(11.dp).zIndex(4f),
                     onClick = { showSettings = true },
             )
         }
@@ -288,8 +490,6 @@ fun ControllerDashboard() {
                 onRemove = { camera ->
                     cameras.remove(camera)
                     prefs.saveCameras(cameras)
-
-                    // Removing the feed on screen promotes whatever is left.
                     if (primaryId == camera.id) primaryId = cameras.firstOrNull()?.id ?: 0
                 },
                 onRename = { camera, newName ->
@@ -299,54 +499,59 @@ fun ControllerDashboard() {
                         prefs.saveCameras(cameras)
                     }
                 },
+                onSetRotation = { camera, rotation ->
+                    val index = cameras.indexOfFirst { it.id == camera.id }
+                    if (index >= 0) {
+                        cameras[index] = camera.copy(rotation = rotation)
+                        prefs.saveCameras(cameras)
+                    }
+                },
         )
     }
 }
 
-/**
- * A secondary feed. Long-press and drag repositions it; a plain tap still
- * promotes it into the primary panel.
- */
+private data class PaneBounds(val x: Dp, val y: Dp, val w: Dp, val h: Dp)
+
 @Composable
-private fun DraggableCameraPanel(
-        camera: CameraSource,
-        isLandscape: Boolean,
-        modifier: Modifier,
-        onClick: () -> Unit,
-) {
-    var offsetX by remember(camera.id) { mutableStateOf(0f) }
-    var offsetY by remember(camera.id) { mutableStateOf(0f) }
-    var dragging by remember(camera.id) { mutableStateOf(false) }
+private fun paneModifier(bounds: PaneBounds, animate: Boolean): Modifier {
+    val spec: AnimationSpec<Dp> =
+            if (animate)
+                    spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow,
+                    )
+            else snap()
 
+    val x by animateDpAsState(targetValue = bounds.x, animationSpec = spec, label = "paneX")
+    val y by animateDpAsState(targetValue = bounds.y, animationSpec = spec, label = "paneY")
+    val w by animateDpAsState(targetValue = bounds.w, animationSpec = spec, label = "paneW")
+    val h by animateDpAsState(targetValue = bounds.h, animationSpec = spec, label = "paneH")
 
-    LaunchedEffect(isLandscape) {
-        offsetX = 0f
-        offsetY = 0f
-        dragging = false
-    }
+    return Modifier.offset(x, y).size(w, h)
+}
 
-    CameraPanel(
-            cameraName = camera.name,
+@Composable
+private fun StowPill(modifier: Modifier, left: Boolean, onClick: () -> Unit) {
+    val shape =
+            if (left) RoundedCornerShape(topEnd = 6.dp, bottomEnd = 6.dp)
+            else RoundedCornerShape(topStart = 6.dp, bottomStart = 6.dp)
+
+    Box(
             modifier =
-                    modifier.offset { IntOffset(offsetX.roundToInt(), offsetY.roundToInt()) }
-                            // A dragged panel floats above its neighbours.
-                            .zIndex(if (dragging) 1f else 0f)
-                            .pointerInput(camera.id) {
-                                detectDragGesturesAfterLongPress(
-                                        onDragStart = { dragging = true },
-                                        onDragEnd = { dragging = false },
-                                        onDragCancel = { dragging = false },
-                                        onDrag = { change, dragAmount ->
-                                            change.consume()
-                                            offsetX += dragAmount.x
-                                            offsetY += dragAmount.y
-                                        },
-                                )
-                            },
-            streamUrl = camera.url,
-            rotation = 90,
-            onClick = onClick,
-    )
+                    modifier.size(width = 15.dp, height = 54.dp)
+                            .clip(shape)
+                            .background(HeaderBackground)
+                            .border(1.dp, BorderColor, shape)
+                            .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center,
+    ) {
+        Text(
+                if (left) ">" else "<",
+                color = MutedText,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+        )
+    }
 }
 
 @Composable
@@ -357,9 +562,7 @@ private fun SettingsButton(modifier: Modifier, onClick: () -> Unit) {
                             .background(color = HeaderBackground, shape = CircleShape)
                             .clickable(onClick = onClick),
             contentAlignment = Alignment.Center,
-    ) {
-        Text("⚙", color = MutedText, fontSize = 14.sp)
-    }
+    ) { Text("⚙", color = MutedText, fontSize = 14.sp) }
 }
 
 @Composable
@@ -369,6 +572,7 @@ private fun CameraSettingsDialog(
         onAdd: (String, String) -> Unit,
         onRemove: (CameraSource) -> Unit,
         onRename: (CameraSource, String) -> Unit,
+        onSetRotation: (CameraSource, Int) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
     var url by remember { mutableStateOf("") }
@@ -407,6 +611,19 @@ private fun CameraSettingsDialog(
                                 Text(
                                         camera.url ?: "-",
                                         color = MutedText,
+                                        fontSize = 10.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                )
+                            }
+
+                            TextButton(
+                                    onClick = {
+                                        onSetRotation(camera, (camera.rotation + 90) % 360)
+                                    },
+                            ) {
+                                Text(
+                                        "${camera.rotation}°",
+                                        color = if (camera.rotation == 0) Green else MutedText,
                                         fontSize = 10.sp,
                                         fontFamily = FontFamily.Monospace,
                                 )
@@ -458,21 +675,123 @@ private fun CameraSettingsDialog(
                                 error = null
                             }
                         }
-                ) {
-                    Text("ADD CAMERA")
-                }
+                ) { Text("ADD CAMERA") }
             },
             dismissButton = { TextButton(onClick = onDismiss) { Text("CLOSE") } },
     )
 }
 
+private object Vlc {
+    private val options =
+            arrayListOf(
+                    "--no-audio",
+                    "--network-caching=0",
+                    "--avcodec-threads=1",
+                    "--clock-synchro=-1",
+                    "--clock-jitter=0",
+                    "--drop-late-frames",
+                    "--skip-frames",
+                    // UDP over TCP: a torn but current frame beats a clean but stale one.
+                    "--no-rtsp-tcp",
+            )
+
+    @Volatile private var instance: LibVLC? = null
+
+    fun get(context: Context): LibVLC =
+            instance
+                    ?: synchronized(this) {
+                        instance
+                                ?: LibVLC(context.applicationContext, options).also {
+                                    instance = it
+                                }
+                    }
+}
+
+private const val PROBE_INTERVAL_MS = 5_000L
+
+private const val PROBE_FAILURES_BEFORE_OFFLINE = 3
+
+private const val RECONNECT_BACKOFF_MS = 1_500L
+
+private const val PROBE_SOCKET_TIMEOUT_MS = 1_000
+
+private data class RtspProbe(val latencyMs: Long?, val reachable: Boolean)
+
+private class RtspPinger(private val streamUrl: String, private val address: InetSocketAddress) {
+    private var socket: Socket? = null
+    private var reader: BufferedReader? = null
+    private var writer: BufferedWriter? = null
+    private var cseq = 0
+
+    // Two passes so a server-side idle timeout costs a reconnect, not a false offline.
+    fun ping(): Long? {
+        repeat(2) {
+            try {
+                if (socket == null) open()
+                return exchange()
+            } catch (_: Exception) {
+                close()
+            }
+        }
+        return null
+    }
+
+    private fun open() {
+        val fresh = Socket()
+        fresh.tcpNoDelay = true
+        fresh.soTimeout = PROBE_SOCKET_TIMEOUT_MS
+        fresh.connect(address, PROBE_SOCKET_TIMEOUT_MS)
+
+        socket = fresh
+        reader = fresh.getInputStream().bufferedReader(Charsets.US_ASCII)
+        writer = fresh.getOutputStream().bufferedWriter(Charsets.US_ASCII)
+    }
+
+    private fun exchange(): Long {
+        val out = writer ?: throw IOException("no writer")
+        val input = reader ?: throw IOException("no reader")
+
+        cseq++
+
+        val startedAt = System.nanoTime()
+
+        out.write("OPTIONS $streamUrl RTSP/1.0\r\n")
+        out.write("CSeq: $cseq\r\n")
+        out.write("User-Agent: CameraRemoteController\r\n\r\n")
+        out.flush()
+
+        val status = input.readLine() ?: throw IOException("closed")
+        val elapsed = (System.nanoTime() - startedAt) / 1_000_000
+
+        if (!status.startsWith("RTSP/")) throw IOException("unexpected: $status")
+
+        while (true) {
+            val line = input.readLine() ?: throw IOException("closed")
+            if (line.isEmpty()) break
+        }
+
+        return elapsed
+    }
+
+    fun close() {
+        try {
+            socket?.close()
+        } catch (_: Exception) {
+        }
+
+        socket = null
+        reader = null
+        writer = null
+    }
+}
+
 @Composable
-private fun rememberRtspResponseTime(streamUrl: String?): Long? {
-    var responseMs by remember(streamUrl) { mutableStateOf<Long?>(null) }
+private fun rememberRtspProbe(streamUrl: String?): RtspProbe {
+    var probe by remember(streamUrl) { mutableStateOf(RtspProbe(null, streamUrl != null)) }
 
     LaunchedEffect(streamUrl) {
         if (streamUrl == null) {
-            responseMs = null
+            probe = RtspProbe(null, false)
             return@LaunchedEffect
         }
 
@@ -488,42 +807,33 @@ private fun rememberRtspResponseTime(streamUrl: String?): Long? {
                 }
 
         if (socketAddress == null) {
-            responseMs = null
+            probe = RtspProbe(null, false)
             return@LaunchedEffect
         }
 
-        while (isActive) {
-            responseMs =
-                    withContext(Dispatchers.IO) {
-                        measureRtspResponseTime(streamUrl, socketAddress)
-                    }
-            delay(3_000)
-        }
-    }
+        val pinger = RtspPinger(streamUrl, socketAddress)
+        var consecutiveFailures = 0
 
-    return responseMs
-}
+        try {
+            while (isActive) {
+                val latency = withContext(Dispatchers.IO) { pinger.ping() }
 
-private fun measureRtspResponseTime(streamUrl: String, socketAddress: InetSocketAddress): Long? {
-    return try {
-        val startedAt = System.nanoTime()
-        Socket().use { socket ->
-            socket.soTimeout = 1_000
-            socket.connect(socketAddress, 1_000)
-            socket.getOutputStream().bufferedWriter(Charsets.US_ASCII).apply {
-                write("OPTIONS $streamUrl RTSP/1.0\r\n")
-                write("CSeq: 1\r\n")
-                write("User-Agent: CameraRemoteController\r\n\r\n")
-                flush()
+                if (latency == null) consecutiveFailures++ else consecutiveFailures = 0
+
+                probe =
+                        RtspProbe(
+                                latencyMs = latency,
+                                reachable = consecutiveFailures < PROBE_FAILURES_BEFORE_OFFLINE,
+                        )
+
+                delay(PROBE_INTERVAL_MS)
             }
-
-            // The first response byte proves that the RTSP server answered.
-            if (socket.getInputStream().read() < 0) return null
+        } finally {
+            withContext(NonCancellable + Dispatchers.IO) { pinger.close() }
         }
-        (System.nanoTime() - startedAt) / 1_000_000
-    } catch (_: Exception) {
-        null
     }
+
+    return probe
 }
 
 @Composable
@@ -558,31 +868,21 @@ private fun CameraPanel(
         onClick: () -> Unit,
         content: @Composable BoxScope.() -> Unit = {},
 ) {
-    val latencyMs = rememberRtspResponseTime(streamUrl)
+    val probe = rememberRtspProbe(streamUrl)
 
-    // The RTSP probe below polls every few seconds, so it is the liveness signal.
-    val online = streamUrl != null && latencyMs != null
+    var playing by remember(streamUrl) { mutableStateOf(false) }
 
-    /*
-     * An unreachable camera keeps its slot rather than collapsing the grid,
-     * but VLC will not recover a stream that died under it. Bumping this
-     * generation rebuilds the player once the probe sees the camera again.
-     * wasOnline starts true so the very first successful probe does not
-     * pointlessly restart a player that is already running.
-     */
-    var streamGeneration by remember(streamUrl) { mutableStateOf(0) }
-    var wasOnline by remember(streamUrl) { mutableStateOf(true) }
-
-    LaunchedEffect(online) {
-        if (online && !wasOnline) streamGeneration++
-        wasOnline = online
-    }
+    val online = streamUrl != null && (playing || probe.reachable)
 
     Box(modifier = modifier.background(Background).clickable(onClick = onClick)) {
         if (streamUrl != null) {
-            // Give each stream its own VLC lifecycle when cameras swap positions.
-            key(streamUrl, streamGeneration) {
-                RtspCameraPreview(streamUrl = streamUrl, rotation = rotation)
+            // Rebuild on the 0/non-0 boundary: SurfaceView and TextureView are chosen at attach.
+            key(streamUrl, rotation != 0) {
+                RtspCameraPreview(
+                        streamUrl = streamUrl,
+                        rotation = rotation,
+                        onPlayingChange = { playing = it },
+                )
             }
         } else {
             Text(
@@ -594,9 +894,7 @@ private fun CameraPanel(
             )
         }
 
-        if (streamUrl != null && !online) {
-            // Fully opaque: a translucent cover let the player's own "RTSP STREAM ERROR"
-            // text show through faintly behind "OFFLINE", showing two duelling messages.
+        if (streamUrl != null && !playing && !probe.reachable) {
             Box(
                     modifier = Modifier.fillMaxSize().background(Background),
                     contentAlignment = Alignment.Center,
@@ -624,9 +922,9 @@ private fun CameraPanel(
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace,
             )
-            if (latencyMs != null) {
+            probe.latencyMs?.let { latency ->
                 Text(
-                        "· ${latencyMs}ms",
+                        "· ${latency}ms",
                         color = MutedText,
                         fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace,
@@ -638,185 +936,115 @@ private fun CameraPanel(
 }
 
 @Composable
-private fun RtspCameraPreview(streamUrl: String, rotation: Int = 0) {
+private fun RtspCameraPreview(
+        streamUrl: String,
+        rotation: Int = 0,
+        onPlayingChange: (Boolean) -> Unit = {},
+) {
     val context = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
 
-    var errorMessage by remember(streamUrl) { mutableStateOf<String?>(null) }
+    val libVlc = remember { Vlc.get(context) }
+    val mediaPlayer = remember(streamUrl) { MediaPlayer(libVlc) }
 
+    var errorMessage by remember(streamUrl) { mutableStateOf<String?>(null) }
     var isPlaying by remember(streamUrl) { mutableStateOf(false) }
 
-    /*
-     * Displayed aspect ratio (width / height) of the decoded video,
-     * already accounting for the transform filter's rotation.
-     * Null until VLC reports the first frame.
-     */
-    var videoAspect by
-            remember(streamUrl, rotation) {
-                /*
-                 * Seeded with the cameras' native 16:9 (rotated when the
-                 * transform filter is on) so there is never a frame where
-                 * the size is unknown -- an unknown size used to fall back
-                 * to VLC's own letterboxed scaling, and which camera lost
-                 * that race varied run to run. Corrected below if a stream
-                 * ever reports something else.
-                 */
-                mutableStateOf(if (rotation == 90 || rotation == 270) 9f / 16f else 16f / 9f)
-            }
+    var attempt by remember(streamUrl) { mutableStateOf(0) }
 
-    /*
-     * IMPORTANT:
-     * Rotate inside VLC.
-     *
-     * Do NOT rotate VLCVideoLayout with Compose graphicsLayer.
-     */
-    val libVlc =
-            remember(streamUrl, rotation) {
-                val options =
-                        arrayListOf(
-                                "--rtsp-tcp",
-                                "--avcodec-hw=none",
-                                "--network-caching=300",
-                                "--no-audio"
-                        )
+    var sourceAspect by remember(streamUrl) { mutableStateOf(16f / 9f) }
 
-                if (rotation == 90 || rotation == 180 || rotation == 270) {
-                    options.add("--video-filter=transform")
-                    options.add("--transform-type=$rotation")
-                }
+    LaunchedEffect(isPlaying) { onPlayingChange(isPlaying) }
 
-                LibVLC(context, options)
-            }
-
-    val mediaPlayer = remember(streamUrl, rotation) { MediaPlayer(libVlc) }
-
-    DisposableEffect(streamUrl, rotation) {
+    DisposableEffect(streamUrl) {
         mediaPlayer.setEventListener { event ->
             when (event.type) {
-                MediaPlayer.Event.Playing -> {
-                    mainHandler.post { isPlaying = true }
-                }
-                MediaPlayer.Event.Vout -> {
-
-                    /*
-                     * Recalculate the video surface after VLC
-                     * knows the real stream dimensions.
-                     */
-                    mainHandler.post {
-                        val track = mediaPlayer.currentVideoTrack
-
-                        if (track != null && track.width > 0 && track.height > 0) {
-                            val sourceAspect = track.width.toFloat() / track.height.toFloat()
-
-                            videoAspect =
-                                    if (rotation == 90 || rotation == 270) 1f / sourceAspect
-                                    else sourceAspect
+                MediaPlayer.Event.Playing ->
+                        mainHandler.post {
+                            isPlaying = true
+                            errorMessage = null
                         }
+                MediaPlayer.Event.Vout ->
+                        mainHandler.post {
+                            val track = mediaPlayer.currentVideoTrack
 
-
-                        /*
-                         * SURFACE_FILL stretches the video to the layout.
-                         * That is safe here because we give the layout the
-                         * correct aspect ratio ourselves (see videoAspect
-                         * below), so nothing is actually distorted.
-                         */
-                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FILL)
-
-                        mediaPlayer.updateVideoSurfaces()
-                    }
-                }
-                MediaPlayer.Event.EncounteredError -> {
-                    mainHandler.post { errorMessage = "RTSP STREAM ERROR" }
-                }
-                MediaPlayer.Event.Buffering -> {
-                    if (event.buffering >= 100f) {
-                        mainHandler.post { isPlaying = true }
-                    }
-                }
+                            if (track != null && track.width > 0 && track.height > 0) {
+                                sourceAspect = track.width.toFloat() / track.height.toFloat()
+                            }
+                            mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FILL)
+                            mediaPlayer.updateVideoSurfaces()
+                        }
+                MediaPlayer.Event.EncounteredError, MediaPlayer.Event.EndReached ->
+                        mainHandler.post {
+                            isPlaying = false
+                            errorMessage = "RECONNECTING..."
+                            attempt++
+                        }
             }
         }
 
+        onDispose {
+            mediaPlayer.setEventListener(null)
+            mediaPlayer.stop()
+            mediaPlayer.detachViews()
+            mediaPlayer.release()
+        }
+    }
+
+    LaunchedEffect(streamUrl, attempt) {
+        if (attempt > 0) delay(RECONNECT_BACKOFF_MS)
+
         val media =
                 Media(libVlc, Uri.parse(streamUrl)).apply {
-                    setHWDecoderEnabled(false, false)
-
-                    addOption(":rtsp-tcp")
-                    addOption(":network-caching=300")
+                    setHWDecoderEnabled(true, false)
+                    addOption(":avcodec-skiploopfilter=4")
+                    addOption(":avcodec-skip-frame=0")
+                    addOption(":avcodec-fast")
+                    addOption(":mediacodec-dr=1")
+                    addOption(":network-caching=0")
+                    addOption(":avcodec-threads=1")
+                    addOption(":clock-synchro=-1")
+                    addOption(":clock-jitter=0")
                     addOption(":no-audio")
+                    addOption(":no-rtsp-tcp")
                 }
 
         mediaPlayer.media = media
         media.release()
 
-        /*
-         * THIS is what makes the video behave like
-         * ContentScale.Crop.
-         *
-         * It preserves aspect ratio and lets VLC crop
-         * the excess to cover the panel.
-         */
-        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN)
-
         mediaPlayer.play()
-
-        onDispose {
-            mediaPlayer.stop()
-            mediaPlayer.detachViews()
-            mediaPlayer.release()
-            libVlc.release()
-        }
     }
 
     BoxWithConstraints(
             modifier = Modifier.fillMaxSize().background(Color.Black).clipToBounds(),
-            contentAlignment = Alignment.Center
+            contentAlignment = Alignment.Center,
     ) {
-        /*
-         * Cover, not contain: scale the video layout up until it fills
-         * the panel on both axes and let clipToBounds() crop the excess.
-         * Letting VLC scale it only ever produced letterboxing, because
-         * the rotated 720x1280 frame does not match the panel shape.
-         */
+        val swapped = rotation == 90 || rotation == 270
+
+        val displayAspect = if (swapped) 1f / sourceAspect else sourceAspect
         val panelAspect = maxWidth / maxHeight
 
-        /*
-         * requiredWidth/requiredHeight, NOT width/height: the plain
-         * modifiers are coerced by the parent's constraints, which clamped
-         * the overflowing axis back to the panel and defeated the whole
-         * point of covering. The required* variants ignore the incoming
-         * constraints, and clipToBounds() above crops the excess.
-         */
+        val wider = displayAspect > panelAspect
+        val screenWidth: Dp = if (wider) maxHeight * displayAspect else maxWidth
+        val screenHeight: Dp = if (wider) maxHeight else maxWidth / displayAspect
+
         val videoModifier =
-                if (videoAspect > panelAspect) {
-                    // Video is wider than the panel: match height, overflow width.
-                    Modifier.requiredHeight(maxHeight).requiredWidth(maxHeight * videoAspect)
-                } else {
-                    // Video is taller than the panel: match width, overflow height.
-                    Modifier.requiredWidth(maxWidth).requiredHeight(maxWidth / videoAspect)
-                }
+                Modifier.requiredWidth(if (swapped) screenHeight else screenWidth)
+                        .requiredHeight(if (swapped) screenWidth else screenHeight)
+                        .graphicsLayer { rotationZ = rotation.toFloat() }
 
         AndroidView(
                 factory = { ctx ->
                     VLCVideoLayout(ctx).also { layout ->
-
-                        /*
-                         * false = no subtitles
-                         * false = SurfaceView instead of TextureView
-                         */
-                        mediaPlayer.attachViews(layout, null, false, false)
+                        mediaPlayer.attachViews(layout, null, false, rotation != 0)
                     }
                 },
-                /*
-                 * The layout changes size on rotation and whenever the
-                 * cover calculation above changes. VLC does not notice on
-                 * its own, so push the new bounds into it.
-                 */
                 modifier =
                         videoModifier.onSizeChanged { size ->
                             if (size.width > 0 && size.height > 0) {
                                 mainHandler.post { mediaPlayer.updateVideoSurfaces() }
                             }
-                        }
+                        },
         )
 
         if (!isPlaying && errorMessage == null) {
@@ -825,7 +1053,7 @@ private fun RtspCameraPreview(streamUrl: String, rotation: Int = 0) {
                     color = Color.White.copy(alpha = 0.5f),
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.align(Alignment.Center)
+                    modifier = Modifier.align(Alignment.Center),
             )
         }
 
@@ -839,7 +1067,7 @@ private fun RtspCameraPreview(streamUrl: String, rotation: Int = 0) {
                     modifier =
                             Modifier.align(Alignment.Center)
                                     .background(Color.Black.copy(alpha = 0.5f))
-                                    .padding(4.dp)
+                                    .padding(4.dp),
             )
         }
     }

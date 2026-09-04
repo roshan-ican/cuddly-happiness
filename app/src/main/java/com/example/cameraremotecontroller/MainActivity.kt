@@ -292,6 +292,13 @@ fun ControllerDashboard() {
                     // Removing the feed on screen promotes whatever is left.
                     if (primaryId == camera.id) primaryId = cameras.firstOrNull()?.id ?: 0
                 },
+                onRename = { camera, newName ->
+                    val index = cameras.indexOfFirst { it.id == camera.id }
+                    if (index >= 0) {
+                        cameras[index] = camera.copy(name = newName)
+                        prefs.saveCameras(cameras)
+                    }
+                },
         )
     }
 }
@@ -311,13 +318,7 @@ private fun DraggableCameraPanel(
     var offsetY by remember(camera.id) { mutableStateOf(0f) }
     var dragging by remember(camera.id) { mutableStateOf(false) }
 
-    /*
-     * Snap back to the slot on a flip, so a panel dragged in landscape does
-     * not reappear displaced in portrait. This is an effect rather than a
-     * remember() key on purpose: keying the state on the orientation also
-     * tore down the gesture detector below during the rotation
-     * recomposition, which left the panel undraggable in portrait.
-     */
+
     LaunchedEffect(isLandscape) {
         offsetX = 0f
         offsetY = 0f
@@ -367,6 +368,7 @@ private fun CameraSettingsDialog(
         onDismiss: () -> Unit,
         onAdd: (String, String) -> Unit,
         onRemove: (CameraSource) -> Unit,
+        onRename: (CameraSource, String) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
     var url by remember { mutableStateOf("") }
@@ -390,11 +392,17 @@ private fun CameraSettingsDialog(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                        camera.name,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        fontFamily = FontFamily.Monospace,
+                                OutlinedTextField(
+                                        value = camera.name,
+                                        onValueChange = { onRename(camera, it) },
+                                        singleLine = true,
+                                        textStyle =
+                                                androidx.compose.ui.text.TextStyle(
+                                                        fontSize = 12.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        fontFamily = FontFamily.Monospace,
+                                                ),
+                                        modifier = Modifier.fillMaxWidth(),
                                 )
                                 Text(
                                         camera.url ?: "-",

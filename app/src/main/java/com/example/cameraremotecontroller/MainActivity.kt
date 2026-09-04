@@ -587,13 +587,14 @@ private fun CameraPanel(
         }
 
         if (streamUrl != null && !online) {
-            // Covers the stale last frame so an offline feed cannot be mistaken for a live one.
+            // Fully opaque: a translucent cover let the player's own "RTSP STREAM ERROR"
+            // text show through faintly behind "OFFLINE", showing two duelling messages.
             Box(
-                    modifier = Modifier.fillMaxSize().background(Background.copy(alpha = 0.82f)),
+                    modifier = Modifier.fillMaxSize().background(Background),
                     contentAlignment = Alignment.Center,
             ) {
                 Text(
-                        "OFFLINE",
+                        "CAMERA OFFLINE",
                         color = Red,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,

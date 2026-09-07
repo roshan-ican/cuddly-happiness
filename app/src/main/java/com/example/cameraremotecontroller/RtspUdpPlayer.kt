@@ -5,6 +5,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Bundle
 import android.util.Log
 import android.view.Surface
 import java.io.BufferedReader
@@ -390,19 +391,31 @@ internal class RtspUdpPlayer(
             val codecInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.first {
                 it.name == codecName
             }
-            if (
+            val lowLatencySupported =
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
                             codecInfo
                                     .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC)
                                     .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
-            ) {
+            if (lowLatencySupported) {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
 
             return MediaCodec.createByCodecName(codecName).apply {
                 configure(format, surface, null, 0)
                 start()
-                Log.i(TAG, "RTSP decoder $codecName for $description")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !lowLatencySupported) {
+                    setParameters(
+                            Bundle().apply {
+                                putInt(MediaCodec.PARAMETER_KEY_LOW_LATENCY, 1)
+                            },
+                    )
+                }
+                Log.i(
+                        TAG,
+                        "RTSP decoder $codecName hardware=${codecInfo.isHardwareAccelerated()} " +
+                                "lowLatencyFeature=$lowLatencySupported " +
+                                "csd=${description.codecSpecificData.size}B $description",
+                )
             }
         }
 

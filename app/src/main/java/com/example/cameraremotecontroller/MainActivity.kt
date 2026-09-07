@@ -52,6 +52,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.withFrameMillis
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
@@ -83,6 +84,7 @@ import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.IOException
 import java.net.InetSocketAddress
+import java.util.Locale
 import java.net.Socket
 import java.net.URI
 import kotlinx.coroutines.Dispatchers
@@ -299,6 +301,8 @@ fun ControllerDashboard() {
 
     Surface(modifier = Modifier.fillMaxSize(), color = Background) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize().clipToBounds()) {
+            LatencyClock(modifier = Modifier.align(Alignment.BottomStart).zIndex(10f))
+
             val screenW = maxWidth
             val screenH = maxHeight
             val margin = 12.dp
@@ -1133,6 +1137,28 @@ private fun RtspCameraPreview(
             )
         }
     }
+}
+
+@Composable
+private fun LatencyClock(modifier: Modifier = Modifier) {
+    var now by remember { mutableStateOf(0L) }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            withFrameMillis { now = System.currentTimeMillis() }
+        }
+    }
+
+    val seconds = (now / 1000) % 100
+    val millis = now % 1000
+
+    Text(
+            text = String.format(Locale.US, "%02d.%03d", seconds, millis),
+            color = Color.Black,
+            fontSize = 44.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = modifier.background(Color.White).padding(horizontal = 12.dp, vertical = 4.dp),
+    )
 }
 
 private class PreviewCallbacks(

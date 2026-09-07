@@ -118,6 +118,8 @@ private val DEFAULT_CAMERAS =
                 CameraSource(2, "CAM 2", CAM2_URL),
         )
 
+private const val SHOW_LATENCY_CLOCK = false
+
 private const val PREFS_NAME = "camera_remote_controller"
 private const val PREFS_KEY_CAMERAS = "cameras"
 
@@ -301,7 +303,9 @@ fun ControllerDashboard() {
 
     Surface(modifier = Modifier.fillMaxSize(), color = Background) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize().clipToBounds()) {
-            LatencyClock(modifier = Modifier.align(Alignment.BottomStart).zIndex(10f))
+            if (SHOW_LATENCY_CLOCK) {
+                LatencyClock(modifier = Modifier.align(Alignment.BottomStart).zIndex(10f))
+            }
 
             val screenW = maxWidth
             val screenH = maxHeight

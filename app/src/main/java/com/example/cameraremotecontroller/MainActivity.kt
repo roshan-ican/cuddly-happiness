@@ -120,6 +120,8 @@ private val DEFAULT_CAMERAS =
 
 private const val SHOW_LATENCY_CLOCK = false
 
+private const val SHOW_DECODE_LATENCY = false
+
 private const val PREFS_NAME = "camera_remote_controller"
 private const val PREFS_KEY_CAMERAS = "cameras"
 
@@ -1356,7 +1358,7 @@ private fun DirectSurfacePreview(
             )
         }
 
-        if (isPlaying) {
+        if (isPlaying && SHOW_DECODE_LATENCY) {
             decoderLatencyMs?.let { latency ->
                 Text(
                         text = "DEC ${latency}ms",

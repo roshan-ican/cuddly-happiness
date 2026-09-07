@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.ComponentActivity
@@ -153,6 +154,10 @@ private fun normalizeCameraUrl(input: String): String? {
 
     if (trimmed.startsWith("siyi://", ignoreCase = true)) {
         return if (parseSiyiDirectUrl(trimmed) != null) trimmed else null
+    }
+
+    if (trimmed.startsWith("rtspll://", ignoreCase = true)) {
+        return if (parseRtspLowLatencyUrl(trimmed) != null) trimmed else null
     }
 
     val withScheme = if (trimmed.contains("://")) trimmed else "rtsp://$trimmed"
@@ -821,7 +826,7 @@ private fun rememberRtspProbe(streamUrl: String?): RtspProbe {
         }
 
         // The direct player owns this private TCP connection. Do not send RTSP OPTIONS to it.
-        if (parseSiyiDirectUrl(streamUrl) != null) {
+        if (parseSiyiDirectUrl(streamUrl) != null || parseRtspLowLatencyUrl(streamUrl) != null) {
             probe = RtspProbe(null, false)
             return@LaunchedEffect
         }
@@ -900,7 +905,9 @@ private fun CameraPanel(
         content: @Composable BoxScope.() -> Unit = {},
 ) {
     val probe = rememberRtspProbe(streamUrl)
-    val isDirect = parseSiyiDirectUrl(streamUrl.orEmpty()) != null
+    val isSiyiDirect = parseSiyiDirectUrl(streamUrl.orEmpty()) != null
+    val isRtspUdp = parseRtspLowLatencyUrl(streamUrl.orEmpty()) != null
+    val isDirect = isSiyiDirect || isRtspUdp
 
     var playing by remember(streamUrl) { mutableStateOf(false) }
 
@@ -910,8 +917,14 @@ private fun CameraPanel(
         if (streamUrl != null) {
             // Rebuild on the 0/non-0 boundary: SurfaceView and TextureView are chosen at attach.
             key(streamUrl, rotation != 0) {
-                if (isDirect) {
+                if (isSiyiDirect) {
                     SiyiDirectCameraPreview(
+                            streamUrl = streamUrl,
+                            rotation = rotation,
+                            onPlayingChange = { playing = it },
+                    )
+                } else if (isRtspUdp) {
+                    RtspUdpCameraPreview(
                             streamUrl = streamUrl,
                             rotation = rotation,
                             onPlayingChange = { playing = it },
@@ -1122,15 +1135,102 @@ private fun RtspCameraPreview(
     }
 }
 
+private class PreviewCallbacks(
+        val onPlaying: () -> Unit,
+        val onLatency: (Long) -> Unit,
+        val onDisconnected: (String) -> Unit,
+)
+
+private interface PreviewPlayer {
+    fun start()
+
+    fun stop()
+}
+
 @Composable
 private fun SiyiDirectCameraPreview(
         streamUrl: String,
         rotation: Int = 0,
         onPlayingChange: (Boolean) -> Unit = {},
 ) {
-    val endpoint = remember(streamUrl) { parseSiyiDirectUrl(streamUrl) }
+    val endpoint = remember(streamUrl) { parseSiyiDirectUrl(streamUrl) } ?: return
+
+    DirectSurfacePreview(
+            streamUrl = streamUrl,
+            rotation = rotation,
+            connectingLabel = "CONNECTING DIRECT...",
+            onPlayingChange = onPlayingChange,
+    ) { surface, callbacks ->
+        val player =
+                SiyiDirectPlayer(
+                        endpoint = endpoint,
+                        surface = surface,
+                        listener =
+                                object : SiyiDirectPlayer.Listener {
+                                    override fun onPlaying() = callbacks.onPlaying()
+
+                                    override fun onDecoderLatency(latencyMs: Long) =
+                                            callbacks.onLatency(latencyMs)
+
+                                    override fun onDisconnected(message: String) =
+                                            callbacks.onDisconnected("DIRECT STREAM RECONNECTING")
+                                },
+                )
+        object : PreviewPlayer {
+            override fun start() = player.start()
+
+            override fun stop() = player.stop()
+        }
+    }
+}
+
+@Composable
+private fun RtspUdpCameraPreview(
+        streamUrl: String,
+        rotation: Int = 0,
+        onPlayingChange: (Boolean) -> Unit = {},
+) {
+    val endpoint = remember(streamUrl) { parseRtspLowLatencyUrl(streamUrl) } ?: return
+
+    DirectSurfacePreview(
+            streamUrl = streamUrl,
+            rotation = rotation,
+            connectingLabel = "CONNECTING RTSP/UDP...",
+            onPlayingChange = onPlayingChange,
+    ) { surface, callbacks ->
+        val player =
+                RtspUdpPlayer(
+                        endpoint = endpoint,
+                        surface = surface,
+                        listener =
+                                object : RtspUdpPlayer.Listener {
+                                    override fun onPlaying() = callbacks.onPlaying()
+
+                                    override fun onDecoderLatency(latencyMs: Long) =
+                                            callbacks.onLatency(latencyMs)
+
+                                    override fun onDisconnected(message: String) =
+                                            callbacks.onDisconnected("RTSP/UDP RECONNECTING")
+                                },
+                )
+        object : PreviewPlayer {
+            override fun start() = player.start()
+
+            override fun stop() = player.stop()
+        }
+    }
+}
+
+@Composable
+private fun DirectSurfacePreview(
+        streamUrl: String,
+        rotation: Int,
+        connectingLabel: String,
+        onPlayingChange: (Boolean) -> Unit,
+        createPlayer: (Surface, PreviewCallbacks) -> PreviewPlayer,
+) {
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
-    val player = remember(streamUrl) { arrayOfNulls<SiyiDirectPlayer>(1) }
+    val player = remember(streamUrl) { arrayOfNulls<PreviewPlayer>(1) }
     var errorMessage by remember(streamUrl) { mutableStateOf<String?>(null) }
     var isPlaying by remember(streamUrl) { mutableStateOf(false) }
     var decoderLatencyMs by remember(streamUrl) { mutableStateOf<Long?>(null) }
@@ -1159,79 +1259,66 @@ private fun SiyiDirectCameraPreview(
                         .requiredHeight(if (swapped) screenWidth else screenHeight)
                         .graphicsLayer { rotationZ = rotation.toFloat() }
 
-        if (endpoint != null) {
-            AndroidView(
-                    factory = { context ->
-                        SurfaceView(context).also { view ->
-                            view.holder.addCallback(
-                                    object : SurfaceHolder.Callback {
-                                        override fun surfaceCreated(holder: SurfaceHolder) {
-                                            val directPlayer =
-                                                    SiyiDirectPlayer(
-                                                            endpoint = endpoint,
-                                                            surface = holder.surface,
-                                                            listener =
-                                                                    object :
-                                                                            SiyiDirectPlayer.Listener {
-                                                                        override fun onPlaying() {
-                                                                            mainHandler.post {
-                                                                                if (!isPlaying) {
-                                                                                    isPlaying = true
-                                                                                    errorMessage = null
-                                                                                    onPlayingChange(true)
-                                                                                }
-                                                                            }
-                                                                        }
+        AndroidView(
+                factory = { context ->
+                    SurfaceView(context).also { view ->
+                        view.holder.addCallback(
+                                object : SurfaceHolder.Callback {
+                                    override fun surfaceCreated(holder: SurfaceHolder) {
+                                        val callbacks =
+                                                PreviewCallbacks(
+                                                        onPlaying = {
+                                                            mainHandler.post {
+                                                                if (!isPlaying) {
+                                                                    isPlaying = true
+                                                                    errorMessage = null
+                                                                    onPlayingChange(true)
+                                                                }
+                                                            }
+                                                        },
+                                                        onLatency = { latency ->
+                                                            mainHandler.post {
+                                                                decoderLatencyMs = latency
+                                                            }
+                                                        },
+                                                        onDisconnected = { message ->
+                                                            mainHandler.post {
+                                                                isPlaying = false
+                                                                errorMessage = message
+                                                                onPlayingChange(false)
+                                                            }
+                                                        },
+                                                )
 
-                                                                        override fun onDecoderLatency(
-                                                                                latencyMs: Long
-                                                                        ) {
-                                                                            mainHandler.post {
-                                                                                decoderLatencyMs = latencyMs
-                                                                            }
-                                                                        }
-
-                                                                        override fun onDisconnected(
-                                                                                message: String
-                                                                        ) {
-                                                                            mainHandler.post {
-                                                                                isPlaying = false
-                                                                                errorMessage =
-                                                                                        "DIRECT STREAM RECONNECTING"
-                                                                                onPlayingChange(false)
-                                                                            }
-                                                                        }
-                                                                    },
-                                                    )
-                                            player[0]?.stop()
-                                            player[0] = directPlayer
-                                            directPlayer.start()
-                                        }
-
-                                        override fun surfaceChanged(
-                                                holder: SurfaceHolder,
-                                                format: Int,
-                                                width: Int,
-                                                height: Int,
-                                        ) = Unit
-
-                                        override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                            player[0]?.stop()
-                                            player[0] = null
-                                            isPlaying = false
-                                            onPlayingChange(false)
-                                        }
+                                        val created = createPlayer(holder.surface, callbacks)
+                                        player[0]?.stop()
+                                        player[0] = created
+                                        created.start()
                                     }
-                            )
-                        }
-                    },
-                    modifier = videoModifier,
-            )
-        }
+
+                                    override fun surfaceChanged(
+                                            holder: SurfaceHolder,
+                                            format: Int,
+                                            width: Int,
+                                            height: Int,
+                                    ) = Unit
+
+                                    override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                        player[0]?.stop()
+                                        player[0] = null
+                                        isPlaying = false
+                                        onPlayingChange(false)
+                                    }
+                                }
+                        )
+                    }
+                },
+                modifier = videoModifier,
+        )
 
         if (!isPlaying) {
             Text(
-                    text = errorMessage ?: "CONNECTING DIRECT...",
+                    text = errorMessage ?: connectingLabel,
                     color = Color.White.copy(alpha = 0.55f),
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,

@@ -400,10 +400,16 @@ internal class SiyiDirectPlayer(
                 }
             }
 
+            var newestIndex = -1
             while (true) {
                 val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
                 if (outputIndex < 0) break
-                codec.releaseOutputBuffer(outputIndex, true)
+                if (newestIndex >= 0) codec.releaseOutputBuffer(newestIndex, false)
+                newestIndex = outputIndex
+            }
+
+            if (newestIndex >= 0) {
+                codec.releaseOutputBuffer(newestIndex, true)
                 listener.onDecoderLatency(
                         (System.nanoTime() / 1_000 - bufferInfo.presentationTimeUs)
                                 .coerceAtLeast(0) / 1_000

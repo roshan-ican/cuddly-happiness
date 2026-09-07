@@ -1051,8 +1051,6 @@ private fun RtspCameraPreview(
                     addOption(":avcodec-fast")
                     addOption(":mediacodec-dr=1")
                     addOption(":network-caching=0")
-                    addOption(":live-caching=0")
-                    addOption(":no-packet-buffering")
                     addOption(":avcodec-threads=1")
                     addOption(":clock-synchro=-1")
                     addOption(":clock-jitter=0")

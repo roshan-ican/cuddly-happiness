@@ -42,6 +42,7 @@ internal fun parseRtspLowLatencyUrl(value: String): RtspEndpoint? {
 internal data class RtspVideoDescription(
         val payloadType: Int,
         val control: String,
+        val mime: String,
         val codecSpecificData: ByteArray,
         val width: Int,
         val height: Int,
@@ -50,13 +51,14 @@ internal data class RtspVideoDescription(
             other is RtspVideoDescription &&
                     payloadType == other.payloadType &&
                     control == other.control &&
+                    mime == other.mime &&
                     width == other.width &&
                     height == other.height &&
                     codecSpecificData.contentEquals(other.codecSpecificData)
 
     override fun hashCode(): Int =
-            (((payloadType * 31 + control.hashCode()) * 31 + width) * 31 + height) * 31 +
-                    codecSpecificData.contentHashCode()
+            ((((payloadType * 31 + control.hashCode()) * 31 + mime.hashCode()) * 31 + width) * 31 +
+                    height) * 31 + codecSpecificData.contentHashCode()
 }
 
 internal object SdpParser {
@@ -66,6 +68,7 @@ internal object SdpParser {
         var control = ""
         var width = 0
         var height = 0
+        var mime = MediaFormat.MIMETYPE_VIDEO_HEVC
         val parameterSets = ByteArrayOutputStream()
 
         sdp.lineSequence().map { it.trim() }.forEach { line ->
@@ -78,6 +81,12 @@ internal object SdpParser {
                 }
                 !inVideo -> Unit
                 line.startsWith("a=control:") -> control = line.removePrefix("a=control:").trim()
+                line.startsWith("a=rtpmap:") -> {
+                    val encoding = line.substringAfter(' ', "").substringBefore('/').trim()
+                    if (encoding.equals("H264", ignoreCase = true)) {
+                        mime = MediaFormat.MIMETYPE_VIDEO_AVC
+                    }
+                }
                 line.startsWith("a=x-dimensions:") -> {
                     val parts = line.removePrefix("a=x-dimensions:").split(',')
                     width = parts.getOrNull(0)?.trim()?.toIntOrNull() ?: 0
@@ -85,7 +94,7 @@ internal object SdpParser {
                 }
                 line.startsWith("a=fmtp:") -> {
                     PARAMETER_SET_KEYS.forEach { key ->
-                        parameterSet(line, key)?.let { nal ->
+                        parameterSets(line, key).forEach { nal ->
                             parameterSets.write(RtpH265Depacketizer.START_CODE)
                             parameterSets.write(nal)
                         }
@@ -98,26 +107,33 @@ internal object SdpParser {
         return RtspVideoDescription(
                 payloadType = payloadType,
                 control = control,
+                mime = mime,
                 codecSpecificData = parameterSets.toByteArray(),
                 width = if (width > 0) width else DEFAULT_WIDTH,
                 height = if (height > 0) height else DEFAULT_HEIGHT,
         )
     }
 
-    private fun parameterSet(line: String, key: String): ByteArray? {
+    private fun parameterSets(line: String, key: String): List<ByteArray> {
         val index = line.indexOf("$key=", ignoreCase = true)
-        if (index < 0) return null
+        if (index < 0) return emptyList()
         val value = line.substring(index + key.length + 1).substringBefore(';').trim()
-        val first = value.split(',').firstOrNull()?.trim().orEmpty()
-        if (first.isEmpty()) return null
-        return try {
-            Base64.getMimeDecoder().decode(first)
-        } catch (_: IllegalArgumentException) {
-            null
+        return value.split(',').mapNotNull { encoded ->
+            val trimmed = encoded.trim()
+            if (trimmed.isEmpty()) {
+                null
+            } else {
+                try {
+                    Base64.getMimeDecoder().decode(trimmed)
+                } catch (_: IllegalArgumentException) {
+                    null
+                }
+            }
         }
     }
 
-    private val PARAMETER_SET_KEYS = listOf("sprop-vps", "sprop-sps", "sprop-pps")
+    private val PARAMETER_SET_KEYS =
+            listOf("sprop-vps", "sprop-sps", "sprop-pps", "sprop-parameter-sets")
     private const val DEFAULT_WIDTH = 1280
     private const val DEFAULT_HEIGHT = 720
 }
@@ -262,7 +278,12 @@ internal class RtspUdpPlayer(
             description: RtspVideoDescription,
             keepAliveMs: Long,
     ) {
-        val depacketizer = RtpH265Depacketizer()
+        val depacketizer: RtpVideoDepacketizer =
+                if (description.mime == MediaFormat.MIMETYPE_VIDEO_AVC) {
+                    RtpH264Depacketizer()
+                } else {
+                    RtpH265Depacketizer()
+                }
         val decoder = LowLatencyVideoDecoder(description, surface, listener)
         val buffer = ByteArray(MAX_DATAGRAM_SIZE)
         val packet = DatagramPacket(buffer, buffer.size)
@@ -384,7 +405,7 @@ internal class RtspUdpPlayer(
 
         private fun createCodec(): MediaCodec {
             val format = MediaFormat.createVideoFormat(
-                    MediaFormat.MIMETYPE_VIDEO_HEVC,
+                    description.mime,
                     description.width,
                     description.height,
             )
@@ -509,7 +530,7 @@ internal class RtspUdpPlayer(
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
                         runCatching {
                             info
-                                    .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC)
+                                    .getCapabilitiesForType(description.mime)
                                     .isFeatureSupported(
                                             MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency,
                                     )
@@ -521,7 +542,7 @@ internal class RtspUdpPlayer(
                     MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { info ->
                         !info.isEncoder &&
                                 info.supportedTypes.any {
-                                    it.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, ignoreCase = true)
+                                    it.equals(description.mime, ignoreCase = true)
                                 }
                     }
 
@@ -538,7 +559,7 @@ internal class RtspUdpPlayer(
             }
                     ?: candidates.firstOrNull { it.isHardwareAccelerated() }
                     ?: candidates.firstOrNull()
-                    ?: error("No decoder for ${MediaFormat.MIMETYPE_VIDEO_HEVC}")
+                    ?: error("No decoder for ${description.mime}")
         }
 
         override fun close() {

@@ -97,6 +97,36 @@ class RtspUdpPlayerTest {
     }
 
     @Test
+    fun `detects h264 and its parameter sets`() {
+        val sps = byteArrayOf(0x67, 0x42, 0x00, 0x1E)
+        val pps = byteArrayOf(0x68, 0xCE.toByte(), 0x3C, 0x80.toByte())
+        val encoder = Base64.getEncoder()
+
+        val sdp = buildString {
+            appendLine("m=video 0 RTP/AVP 96")
+            appendLine("a=rtpmap:96 H264/90000")
+            appendLine("a=control:track1")
+            append("a=fmtp:96 packetization-mode=1;sprop-parameter-sets=")
+            appendLine("${encoder.encodeToString(sps)},${encoder.encodeToString(pps)}")
+        }
+
+        val description = SdpParser.parseVideo(sdp)!!
+
+        assertEquals("video/avc", description.mime)
+        assertArrayEquals(
+                RtpH265Depacketizer.START_CODE + sps + RtpH265Depacketizer.START_CODE + pps,
+                description.codecSpecificData,
+        )
+    }
+
+    @Test
+    fun `defaults to h265`() {
+        val sdp = "m=video 0 RTP/AVP 96\na=rtpmap:96 H265/90000"
+
+        assertEquals("video/hevc", SdpParser.parseVideo(sdp)!!.mime)
+    }
+
+    @Test
     fun `returns null when there is no video track`() {
         assertNull(SdpParser.parseVideo("m=audio 0 RTP/AVP 8\na=control:audiotrack"))
     }

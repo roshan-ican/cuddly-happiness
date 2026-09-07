@@ -1330,10 +1330,14 @@ private fun DirectSurfacePreview(
             decoderLatencyMs?.let { latency ->
                 Text(
                         text = "DEC ${latency}ms",
-                        color = Color.White.copy(alpha = 0.6f),
-                        fontSize = 9.sp,
+                        color = Color.White,
+                        fontSize = 16.sp,
                         fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
+                        modifier =
+                                Modifier.align(Alignment.BottomEnd)
+                                        .padding(8.dp)
+                                        .background(Color.Black.copy(alpha = 0.6f))
+                                        .padding(horizontal = 8.dp, vertical = 4.dp),
                 )
             }
         }

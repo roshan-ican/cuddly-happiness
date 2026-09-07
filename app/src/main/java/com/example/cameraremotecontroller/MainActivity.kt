@@ -12,6 +12,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.core.AnimationSpec
@@ -145,9 +147,13 @@ private fun SharedPreferences.saveCameras(cameras: List<CameraSource>) {
     edit().putString(PREFS_KEY_CAMERAS, raw).apply()
 }
 
-private fun normalizeRtspUrl(input: String): String? {
+private fun normalizeCameraUrl(input: String): String? {
     val trimmed = input.trim()
     if (trimmed.isEmpty()) return null
+
+    if (trimmed.startsWith("siyi://", ignoreCase = true)) {
+        return if (parseSiyiDirectUrl(trimmed) != null) trimmed else null
+    }
 
     val withScheme = if (trimmed.contains("://")) trimmed else "rtsp://$trimmed"
     if (!withScheme.startsWith("rtsp://")) return null
@@ -506,6 +512,13 @@ fun ControllerDashboard() {
                         prefs.saveCameras(cameras)
                     }
                 },
+                onSetUrl = { camera, newUrl ->
+                    val index = cameras.indexOfFirst { it.id == camera.id }
+                    if (index >= 0) {
+                        cameras[index] = camera.copy(url = newUrl)
+                        prefs.saveCameras(cameras)
+                    }
+                },
         )
     }
 }
@@ -573,6 +586,7 @@ private fun CameraSettingsDialog(
         onRemove: (CameraSource) -> Unit,
         onRename: (CameraSource, String) -> Unit,
         onSetRotation: (CameraSource, Int) -> Unit,
+        onSetUrl: (CameraSource, String) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
     var url by remember { mutableStateOf("") }
@@ -629,6 +643,17 @@ private fun CameraSettingsDialog(
                                 )
                             }
 
+                            toggleSiyiTransport(camera.url)?.let { alternateUrl ->
+                                val usingDirect = parseSiyiDirectUrl(camera.url.orEmpty()) != null
+                                TextButton(onClick = { onSetUrl(camera, alternateUrl) }) {
+                                    Text(
+                                            if (usingDirect) "RTSP" else "DIRECT",
+                                            color = if (usingDirect) MutedText else Green,
+                                            fontSize = 10.sp,
+                                        )
+                                }
+                            }
+
                             TextButton(onClick = { onRemove(camera) }) {
                                 Text("REMOVE", color = Red, fontSize = 10.sp)
                             }
@@ -646,9 +671,9 @@ private fun CameraSettingsDialog(
                     OutlinedTextField(
                             value = url,
                             onValueChange = { url = it },
-                            label = { Text("RTSP URL OR IP", fontSize = 11.sp) },
+                            label = { Text("RTSP OR SIYI DIRECT URL", fontSize = 11.sp) },
                             placeholder = {
-                                Text("192.168.144.27:8554/main.264", fontSize = 11.sp)
+                                Text("siyi://192.168.144.25:37256", fontSize = 11.sp)
                             },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
@@ -662,10 +687,10 @@ private fun CameraSettingsDialog(
             confirmButton = {
                 TextButton(
                         onClick = {
-                            val normalized = normalizeRtspUrl(url)
+                            val normalized = normalizeCameraUrl(url)
 
                             if (normalized == null) {
-                                error = "ENTER A VALID RTSP ADDRESS"
+                                error = "ENTER A VALID RTSP OR SIYI ADDRESS"
                             } else {
                                 val label = name.trim().ifEmpty { "CAM ${cameras.size + 1}" }
 
@@ -795,6 +820,12 @@ private fun rememberRtspProbe(streamUrl: String?): RtspProbe {
             return@LaunchedEffect
         }
 
+        // The direct player owns this private TCP connection. Do not send RTSP OPTIONS to it.
+        if (parseSiyiDirectUrl(streamUrl) != null) {
+            probe = RtspProbe(null, false)
+            return@LaunchedEffect
+        }
+
         val uri = URI(streamUrl)
         val port = if (uri.port >= 0) uri.port else 554
         val socketAddress =
@@ -869,20 +900,29 @@ private fun CameraPanel(
         content: @Composable BoxScope.() -> Unit = {},
 ) {
     val probe = rememberRtspProbe(streamUrl)
+    val isDirect = parseSiyiDirectUrl(streamUrl.orEmpty()) != null
 
     var playing by remember(streamUrl) { mutableStateOf(false) }
 
-    val online = streamUrl != null && (playing || probe.reachable)
+    val online = streamUrl != null && (playing || (!isDirect && probe.reachable))
 
     Box(modifier = modifier.background(Background).clickable(onClick = onClick)) {
         if (streamUrl != null) {
             // Rebuild on the 0/non-0 boundary: SurfaceView and TextureView are chosen at attach.
             key(streamUrl, rotation != 0) {
-                RtspCameraPreview(
-                        streamUrl = streamUrl,
-                        rotation = rotation,
-                        onPlayingChange = { playing = it },
-                )
+                if (isDirect) {
+                    SiyiDirectCameraPreview(
+                            streamUrl = streamUrl,
+                            rotation = rotation,
+                            onPlayingChange = { playing = it },
+                    )
+                } else {
+                    RtspCameraPreview(
+                            streamUrl = streamUrl,
+                            rotation = rotation,
+                            onPlayingChange = { playing = it },
+                    )
+                }
             }
         } else {
             Text(
@@ -894,7 +934,7 @@ private fun CameraPanel(
             )
         }
 
-        if (streamUrl != null && !playing && !probe.reachable) {
+        if (streamUrl != null && !isDirect && !playing && !probe.reachable) {
             Box(
                     modifier = Modifier.fillMaxSize().background(Background),
                     contentAlignment = Alignment.Center,
@@ -922,6 +962,15 @@ private fun CameraPanel(
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace,
             )
+            if (isDirect) {
+                Text(
+                        "DIRECT",
+                        color = Green,
+                        fontSize = 8.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                )
+            }
             probe.latencyMs?.let { latency ->
                 Text(
                         "· ${latency}ms",
@@ -1002,6 +1051,8 @@ private fun RtspCameraPreview(
                     addOption(":avcodec-fast")
                     addOption(":mediacodec-dr=1")
                     addOption(":network-caching=0")
+                    addOption(":live-caching=0")
+                    addOption(":no-packet-buffering")
                     addOption(":avcodec-threads=1")
                     addOption(":clock-synchro=-1")
                     addOption(":clock-jitter=0")
@@ -1070,5 +1121,150 @@ private fun RtspCameraPreview(
                                     .padding(4.dp),
             )
         }
+    }
+}
+
+@Composable
+private fun SiyiDirectCameraPreview(
+        streamUrl: String,
+        rotation: Int = 0,
+        onPlayingChange: (Boolean) -> Unit = {},
+) {
+    val endpoint = remember(streamUrl) { parseSiyiDirectUrl(streamUrl) }
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val player = remember(streamUrl) { arrayOfNulls<SiyiDirectPlayer>(1) }
+    var errorMessage by remember(streamUrl) { mutableStateOf<String?>(null) }
+    var isPlaying by remember(streamUrl) { mutableStateOf(false) }
+    var decoderLatencyMs by remember(streamUrl) { mutableStateOf<Long?>(null) }
+
+    DisposableEffect(streamUrl) {
+        onDispose {
+            player[0]?.stop()
+            player[0] = null
+            onPlayingChange(false)
+        }
+    }
+
+    BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().background(Color.Black).clipToBounds(),
+            contentAlignment = Alignment.Center,
+    ) {
+        val sourceAspect = 16f / 9f
+        val swapped = rotation == 90 || rotation == 270
+        val displayAspect = if (swapped) 1f / sourceAspect else sourceAspect
+        val panelAspect = maxWidth / maxHeight
+        val wider = displayAspect > panelAspect
+        val screenWidth: Dp = if (wider) maxHeight * displayAspect else maxWidth
+        val screenHeight: Dp = if (wider) maxHeight else maxWidth / displayAspect
+        val videoModifier =
+                Modifier.requiredWidth(if (swapped) screenHeight else screenWidth)
+                        .requiredHeight(if (swapped) screenWidth else screenHeight)
+                        .graphicsLayer { rotationZ = rotation.toFloat() }
+
+        if (endpoint != null) {
+            AndroidView(
+                    factory = { context ->
+                        SurfaceView(context).also { view ->
+                            view.holder.addCallback(
+                                    object : SurfaceHolder.Callback {
+                                        override fun surfaceCreated(holder: SurfaceHolder) {
+                                            val directPlayer =
+                                                    SiyiDirectPlayer(
+                                                            endpoint = endpoint,
+                                                            surface = holder.surface,
+                                                            listener =
+                                                                    object :
+                                                                            SiyiDirectPlayer.Listener {
+                                                                        override fun onPlaying() {
+                                                                            mainHandler.post {
+                                                                                if (!isPlaying) {
+                                                                                    isPlaying = true
+                                                                                    errorMessage = null
+                                                                                    onPlayingChange(true)
+                                                                                }
+                                                                            }
+                                                                        }
+
+                                                                        override fun onDecoderLatency(
+                                                                                latencyMs: Long
+                                                                        ) {
+                                                                            mainHandler.post {
+                                                                                decoderLatencyMs = latencyMs
+                                                                            }
+                                                                        }
+
+                                                                        override fun onDisconnected(
+                                                                                message: String
+                                                                        ) {
+                                                                            mainHandler.post {
+                                                                                isPlaying = false
+                                                                                errorMessage =
+                                                                                        "DIRECT STREAM RECONNECTING"
+                                                                                onPlayingChange(false)
+                                                                            }
+                                                                        }
+                                                                    },
+                                                    )
+                                            player[0]?.stop()
+                                            player[0] = directPlayer
+                                            directPlayer.start()
+                                        }
+
+                                        override fun surfaceChanged(
+                                                holder: SurfaceHolder,
+                                                format: Int,
+                                                width: Int,
+                                                height: Int,
+                                        ) = Unit
+
+                                        override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                            player[0]?.stop()
+                                            player[0] = null
+                                            isPlaying = false
+                                            onPlayingChange(false)
+                                        }
+                                    }
+                            )
+                        }
+                    },
+                    modifier = videoModifier,
+            )
+        }
+
+        if (!isPlaying) {
+            Text(
+                    text = errorMessage ?: "CONNECTING DIRECT...",
+                    color = Color.White.copy(alpha = 0.55f),
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.align(Alignment.Center),
+            )
+        }
+
+        if (isPlaying) {
+            decoderLatencyMs?.let { latency ->
+                Text(
+                        text = "DEC ${latency}ms",
+                        color = Color.White.copy(alpha = 0.6f),
+                        fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
+                )
+            }
+        }
+    }
+}
+
+private fun toggleSiyiTransport(url: String?): String? {
+    if (url == null) return null
+    parseSiyiDirectUrl(url)?.let { endpoint ->
+        return "rtsp://${endpoint.host}:8554/main.264"
+    }
+
+    return try {
+        val host = URI(url).host ?: return null
+        "siyi://$host:37256"
+    } catch (_: Exception) {
+        null
     }
 }

@@ -379,6 +379,8 @@ internal class RtspUdpPlayer(
         private var statsLatencySum = 0L
         private var statsLatencyMin = Long.MAX_VALUE
         private var statsLatencyMax = 0L
+        private var droppedFrames = 0
+        private var starvedInputs = 0
 
         private fun createCodec(): MediaCodec {
             val format = MediaFormat.createVideoFormat(
@@ -392,16 +394,9 @@ internal class RtspUdpPlayer(
                 format.setByteBuffer("csd-0", ByteBuffer.wrap(description.codecSpecificData))
             }
 
-            val codecName = MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(format)
-                    ?: error("No decoder for ${MediaFormat.MIMETYPE_VIDEO_HEVC}")
-            val codecInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.first {
-                it.name == codecName
-            }
-            val lowLatencySupported =
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
-                            codecInfo
-                                    .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC)
-                                    .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+            val codecInfo = selectDecoder()
+            val codecName = codecInfo.name
+            val lowLatencySupported = advertisesLowLatency(codecInfo)
             format.setInteger(KEY_LOW_LATENCY_COMPAT, 1)
 
             return MediaCodec.createByCodecName(codecName).apply {
@@ -433,7 +428,9 @@ internal class RtspUdpPlayer(
         fun offer(accessUnit: ByteArray) {
             if (accessUnit.isEmpty()) return
 
-            val inputIndex = codec.dequeueInputBuffer(0)
+            renderNewestFrame()
+
+            val inputIndex = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
             if (inputIndex >= 0) {
                 val input = codec.getInputBuffer(inputIndex)
                 if (input != null && accessUnit.size <= input.capacity()) {
@@ -449,27 +446,36 @@ internal class RtspUdpPlayer(
                 } else {
                     codec.queueInputBuffer(inputIndex, 0, 0, 0, 0)
                 }
+            } else {
+                starvedInputs++
             }
 
+            renderNewestFrame()
+        }
+
+        private fun renderNewestFrame() {
             var newestIndex = -1
             while (true) {
                 val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
                 if (outputIndex < 0) break
-                if (newestIndex >= 0) codec.releaseOutputBuffer(newestIndex, false)
+                if (newestIndex >= 0) {
+                    codec.releaseOutputBuffer(newestIndex, false)
+                    droppedFrames++
+                }
                 newestIndex = outputIndex
             }
 
-            if (newestIndex >= 0) {
-                codec.releaseOutputBuffer(newestIndex, true)
-                val latencyMs =
-                        (System.nanoTime() / 1_000 - bufferInfo.presentationTimeUs)
-                                .coerceAtLeast(0) / 1_000
-                listener.onDecoderLatency(latencyMs)
-                recordStats(latencyMs)
-                if (!reportedPlaying) {
-                    reportedPlaying = true
-                    listener.onPlaying()
-                }
+            if (newestIndex < 0) return
+
+            codec.releaseOutputBuffer(newestIndex, true)
+            val latencyMs =
+                    (System.nanoTime() / 1_000 - bufferInfo.presentationTimeUs)
+                            .coerceAtLeast(0) / 1_000
+            listener.onDecoderLatency(latencyMs)
+            recordStats(latencyMs)
+            if (!reportedPlaying) {
+                reportedPlaying = true
+                listener.onPlaying()
             }
         }
 
@@ -487,7 +493,7 @@ internal class RtspUdpPlayer(
                     TAG,
                     "decode frames=$statsFrames fps=${statsFrames * 1000 / elapsed} " +
                             "latency min=${statsLatencyMin}ms avg=${statsLatencySum / statsFrames}ms " +
-                            "max=${statsLatencyMax}ms",
+                            "max=${statsLatencyMax}ms dropped=$droppedFrames starved=$starvedInputs",
             )
 
             statsWindowStart = now
@@ -495,6 +501,44 @@ internal class RtspUdpPlayer(
             statsLatencySum = 0
             statsLatencyMin = Long.MAX_VALUE
             statsLatencyMax = 0
+            droppedFrames = 0
+            starvedInputs = 0
+        }
+
+        private fun advertisesLowLatency(info: MediaCodecInfo): Boolean =
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                        runCatching {
+                            info
+                                    .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC)
+                                    .isFeatureSupported(
+                                            MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency,
+                                    )
+                        }
+                                .getOrDefault(false)
+
+        private fun selectDecoder(): MediaCodecInfo {
+            val candidates =
+                    MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { info ->
+                        !info.isEncoder &&
+                                info.supportedTypes.any {
+                                    it.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, ignoreCase = true)
+                                }
+                    }
+
+            candidates.forEach { info ->
+                Log.i(
+                        TAG,
+                        "candidate ${info.name} hardware=${info.isHardwareAccelerated()} " +
+                                "lowLatency=${advertisesLowLatency(info)}",
+                )
+            }
+
+            return candidates.firstOrNull {
+                it.isHardwareAccelerated() && advertisesLowLatency(it)
+            }
+                    ?: candidates.firstOrNull { it.isHardwareAccelerated() }
+                    ?: candidates.firstOrNull()
+                    ?: error("No decoder for ${MediaFormat.MIMETYPE_VIDEO_HEVC}")
         }
 
         override fun close() {
@@ -519,6 +563,7 @@ internal class RtspUdpPlayer(
         const val RTP_PORT_RANGE = 200
         const val KEY_LOW_LATENCY_COMPAT = "low-latency"
         const val STATS_INTERVAL_MS = 3_000L
+        const val INPUT_TIMEOUT_US = 4_000L
     }
 }
 

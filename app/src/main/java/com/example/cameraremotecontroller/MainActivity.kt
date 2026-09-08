@@ -292,7 +292,13 @@ fun ControllerDashboard() {
             val margin = 12.dp
 
             val floatW = minOf(screenW, screenH) * 0.32f
-            val floatH = minOf(floatW * 16f / 9f, screenH * 0.8f)
+            // Match the pane to the rotated video so the fitted surface leaves no bars.
+            val floatUpright = floating?.rotation?.let { it == 90 || it == 270 } ?: true
+            val floatH =
+                    minOf(
+                            if (floatUpright) floatW * 16f / 9f else floatW * 9f / 16f,
+                            screenH * 0.8f,
+                    )
             val canFloat = cameras.size >= 2
             val showPlaceholder = cameras.size < 2
             val splitCount = if (showPlaceholder) 1 else docked.size
@@ -428,6 +434,7 @@ fun ControllerDashboard() {
                                             .then(gestures),
                             streamUrl = cam.url,
                             rotation = cam.rotation,
+                            floating = isFloat,
                             onClick = {
                                 when {
                                     isFloat -> dock()
@@ -717,6 +724,7 @@ private fun CameraPanel(
         modifier: Modifier,
         streamUrl: String?,
         rotation: Int = 0,
+        floating: Boolean = false,
         onClick: () -> Unit,
         content: @Composable BoxScope.() -> Unit = {},
 ) {
@@ -730,6 +738,7 @@ private fun CameraPanel(
                 RtspUdpCameraPreview(
                         streamUrl = streamUrl,
                         rotation = rotation,
+                        floating = floating,
                         onPlayingChange = { playing = it },
                 )
             }
@@ -799,6 +808,7 @@ private interface PreviewPlayer {
 private fun RtspUdpCameraPreview(
         streamUrl: String,
         rotation: Int = 0,
+        floating: Boolean = false,
         onPlayingChange: (Boolean) -> Unit = {},
 ) {
     val endpoint = remember(streamUrl) { parseRtspLowLatencyUrl(streamUrl) } ?: return
@@ -806,6 +816,7 @@ private fun RtspUdpCameraPreview(
     DirectSurfacePreview(
             streamUrl = streamUrl,
             rotation = rotation,
+            floating = floating,
             connectingLabel = "CONNECTING RTSP/UDP...",
             onPlayingChange = onPlayingChange,
     ) { surface, callbacks ->
@@ -836,6 +847,7 @@ private fun RtspUdpCameraPreview(
 private fun DirectSurfacePreview(
         streamUrl: String,
         rotation: Int,
+        floating: Boolean,
         connectingLabel: String,
         onPlayingChange: (Boolean) -> Unit,
         createPlayer: (Surface, PreviewCallbacks) -> PreviewPlayer,
@@ -862,50 +874,60 @@ private fun DirectSurfacePreview(
         val swapped = rotation == 90 || rotation == 270
         val displayAspect = if (swapped) 1f / sourceAspect else sourceAspect
         val panelAspect = maxWidth / maxHeight
-        val wider = displayAspect > panelAspect
-        val screenWidth: Dp = if (wider) maxHeight * displayAspect else maxWidth
-        val screenHeight: Dp = if (wider) maxHeight else maxWidth / displayAspect
+        // Cover fills the pane and relies on clipping; a floating SurfaceView is its own
+        // compositor layer that Compose cannot clip, so it has to fit inside instead.
+        val cover = if (floating) displayAspect < panelAspect else displayAspect > panelAspect
+        val screenWidth: Dp = if (cover) maxHeight * displayAspect else maxWidth
+        val screenHeight: Dp = if (cover) maxHeight else maxWidth / displayAspect
         val videoModifier =
                 Modifier.requiredWidth(if (swapped) screenHeight else screenWidth)
                         .requiredHeight(if (swapped) screenWidth else screenHeight)
                         .graphicsLayer { rotationZ = rotation.toFloat() }
+
+        fun attach(surface: Surface) {
+            val callbacks =
+                    PreviewCallbacks(
+                            onPlaying = {
+                                mainHandler.post {
+                                    if (!isPlaying) {
+                                        isPlaying = true
+                                        errorMessage = null
+                                        onPlayingChange(true)
+                                    }
+                                }
+                            },
+                            onLatency = { latency ->
+                                mainHandler.post { decoderLatencyMs = latency }
+                            },
+                            onDisconnected = { message ->
+                                mainHandler.post {
+                                    isPlaying = false
+                                    errorMessage = message
+                                    onPlayingChange(false)
+                                }
+                            },
+                    )
+
+            val created = createPlayer(surface, callbacks)
+            player[0]?.stop()
+            player[0] = created
+            created.start()
+        }
+
+        fun detach() {
+            player[0]?.stop()
+            player[0] = null
+            isPlaying = false
+            onPlayingChange(false)
+        }
 
         AndroidView(
                 factory = { context ->
                     SurfaceView(context).also { view ->
                         view.holder.addCallback(
                                 object : SurfaceHolder.Callback {
-                                    override fun surfaceCreated(holder: SurfaceHolder) {
-                                        val callbacks =
-                                                PreviewCallbacks(
-                                                        onPlaying = {
-                                                            mainHandler.post {
-                                                                if (!isPlaying) {
-                                                                    isPlaying = true
-                                                                    errorMessage = null
-                                                                    onPlayingChange(true)
-                                                                }
-                                                            }
-                                                        },
-                                                        onLatency = { latency ->
-                                                            mainHandler.post {
-                                                                decoderLatencyMs = latency
-                                                            }
-                                                        },
-                                                        onDisconnected = { message ->
-                                                            mainHandler.post {
-                                                                isPlaying = false
-                                                                errorMessage = message
-                                                                onPlayingChange(false)
-                                                            }
-                                                        },
-                                                )
-
-                                        val created = createPlayer(holder.surface, callbacks)
-                                        player[0]?.stop()
-                                        player[0] = created
-                                        created.start()
-                                    }
+                                    override fun surfaceCreated(holder: SurfaceHolder) =
+                                            attach(holder.surface)
 
                                     override fun surfaceChanged(
                                             holder: SurfaceHolder,
@@ -914,12 +936,7 @@ private fun DirectSurfacePreview(
                                             height: Int,
                                     ) = Unit
 
-                                    override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                        player[0]?.stop()
-                                        player[0] = null
-                                        isPlaying = false
-                                        onPlayingChange(false)
-                                    }
+                                    override fun surfaceDestroyed(holder: SurfaceHolder) = detach()
                                 }
                         )
                     }

@@ -5,7 +5,6 @@ import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
-import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
@@ -80,30 +79,15 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.cameraremotecontroller.ui.theme.CameraRemoteControllerTheme
-import java.io.BufferedReader
-import java.io.BufferedWriter
-import java.io.IOException
-import java.net.InetSocketAddress
 import java.util.Locale
-import java.net.Socket
-import java.net.URI
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.withContext
-import org.videolan.libvlc.LibVLC
-import org.videolan.libvlc.Media
-import org.videolan.libvlc.MediaPlayer
-import org.videolan.libvlc.util.VLCVideoLayout
 
 // // PC Tunnel URLs (use when PC is bridging the connection)
 // private const val CAM1_URL = "rtsp://10.252.176.114:8554/main.264"
 // private const val CAM2_URL = "rtsp://10.252.176.114:8555/main.264"
 
 // Real Camera URLs (Uncomment and use when phone is directly on the camera network)
-private const val CAM1_URL = "rtsp://192.168.144.25:8554/main.264"
-private const val CAM2_URL = "rtsp://192.168.144.26:8554/main.264"
+private const val CAM1_URL = "rtspll://192.168.144.25:8554/main.264"
+private const val CAM2_URL = "rtspll://192.168.144.26:8554/main.264"
 
 private data class CameraSource(
         val id: Int,
@@ -158,23 +142,17 @@ private fun normalizeCameraUrl(input: String): String? {
     val trimmed = input.trim()
     if (trimmed.isEmpty()) return null
 
-    if (trimmed.startsWith("siyi://", ignoreCase = true)) {
-        return if (parseSiyiDirectUrl(trimmed) != null) trimmed else null
-    }
+    // Everything lands on rtspll://: it is the only player left.
+    val candidate =
+            when {
+                trimmed.startsWith("rtspll://", ignoreCase = true) -> trimmed
+                trimmed.startsWith("rtsp://", ignoreCase = true) ->
+                        "rtspll://" + trimmed.substring(7)
+                trimmed.contains("://") -> return null
+                else -> "rtspll://$trimmed"
+            }
 
-    if (trimmed.startsWith("rtspll://", ignoreCase = true)) {
-        return if (parseRtspLowLatencyUrl(trimmed) != null) trimmed else null
-    }
-
-    val withScheme = if (trimmed.contains("://")) trimmed else "rtsp://$trimmed"
-    if (!withScheme.startsWith("rtsp://")) return null
-
-    return try {
-        val uri = URI(withScheme)
-        if (uri.host.isNullOrBlank()) null else withScheme
-    } catch (_: Exception) {
-        null
-    }
+    return if (parseRtspLowLatencyUrl(candidate) != null) candidate else null
 }
 
 private val Background = Color(0xFF111216)
@@ -658,17 +636,6 @@ private fun CameraSettingsDialog(
                                 )
                             }
 
-                            toggleSiyiTransport(camera.url)?.let { alternateUrl ->
-                                val usingDirect = parseSiyiDirectUrl(camera.url.orEmpty()) != null
-                                TextButton(onClick = { onSetUrl(camera, alternateUrl) }) {
-                                    Text(
-                                            if (usingDirect) "RTSP" else "DIRECT",
-                                            color = if (usingDirect) MutedText else Green,
-                                            fontSize = 10.sp,
-                                        )
-                                }
-                            }
-
                             TextButton(onClick = { onRemove(camera) }) {
                                 Text("REMOVE", color = Red, fontSize = 10.sp)
                             }
@@ -686,9 +653,9 @@ private fun CameraSettingsDialog(
                     OutlinedTextField(
                             value = url,
                             onValueChange = { url = it },
-                            label = { Text("RTSP OR SIYI DIRECT URL", fontSize = 11.sp) },
+                            label = { Text("CAMERA ADDRESS", fontSize = 11.sp) },
                             placeholder = {
-                                Text("siyi://192.168.144.25:37256", fontSize = 11.sp)
+                                Text("192.168.144.25:8554/main.264", fontSize = 11.sp)
                             },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
@@ -719,167 +686,6 @@ private fun CameraSettingsDialog(
             },
             dismissButton = { TextButton(onClick = onDismiss) { Text("CLOSE") } },
     )
-}
-
-private object Vlc {
-    private val options =
-            arrayListOf(
-                    "--no-audio",
-                    "--network-caching=0",
-                    "--avcodec-threads=1",
-                    "--clock-synchro=-1",
-                    "--clock-jitter=0",
-                    "--drop-late-frames",
-                    "--skip-frames",
-                    // UDP over TCP: a torn but current frame beats a clean but stale one.
-                    "--no-rtsp-tcp",
-            )
-
-    @Volatile private var instance: LibVLC? = null
-
-    fun get(context: Context): LibVLC =
-            instance
-                    ?: synchronized(this) {
-                        instance
-                                ?: LibVLC(context.applicationContext, options).also {
-                                    instance = it
-                                }
-                    }
-}
-
-private const val PROBE_INTERVAL_MS = 5_000L
-
-private const val PROBE_FAILURES_BEFORE_OFFLINE = 3
-
-private const val RECONNECT_BACKOFF_MS = 1_500L
-
-private const val PROBE_SOCKET_TIMEOUT_MS = 1_000
-
-private data class RtspProbe(val latencyMs: Long?, val reachable: Boolean)
-
-private class RtspPinger(private val streamUrl: String, private val address: InetSocketAddress) {
-    private var socket: Socket? = null
-    private var reader: BufferedReader? = null
-    private var writer: BufferedWriter? = null
-    private var cseq = 0
-
-    // Two passes so a server-side idle timeout costs a reconnect, not a false offline.
-    fun ping(): Long? {
-        repeat(2) {
-            try {
-                if (socket == null) open()
-                return exchange()
-            } catch (_: Exception) {
-                close()
-            }
-        }
-        return null
-    }
-
-    private fun open() {
-        val fresh = Socket()
-        fresh.tcpNoDelay = true
-        fresh.soTimeout = PROBE_SOCKET_TIMEOUT_MS
-        fresh.connect(address, PROBE_SOCKET_TIMEOUT_MS)
-
-        socket = fresh
-        reader = fresh.getInputStream().bufferedReader(Charsets.US_ASCII)
-        writer = fresh.getOutputStream().bufferedWriter(Charsets.US_ASCII)
-    }
-
-    private fun exchange(): Long {
-        val out = writer ?: throw IOException("no writer")
-        val input = reader ?: throw IOException("no reader")
-
-        cseq++
-
-        val startedAt = System.nanoTime()
-
-        out.write("OPTIONS $streamUrl RTSP/1.0\r\n")
-        out.write("CSeq: $cseq\r\n")
-        out.write("User-Agent: CameraRemoteController\r\n\r\n")
-        out.flush()
-
-        val status = input.readLine() ?: throw IOException("closed")
-        val elapsed = (System.nanoTime() - startedAt) / 1_000_000
-
-        if (!status.startsWith("RTSP/")) throw IOException("unexpected: $status")
-
-        while (true) {
-            val line = input.readLine() ?: throw IOException("closed")
-            if (line.isEmpty()) break
-        }
-
-        return elapsed
-    }
-
-    fun close() {
-        try {
-            socket?.close()
-        } catch (_: Exception) {
-        }
-
-        socket = null
-        reader = null
-        writer = null
-    }
-}
-
-@Composable
-private fun rememberRtspProbe(streamUrl: String?): RtspProbe {
-    var probe by remember(streamUrl) { mutableStateOf(RtspProbe(null, streamUrl != null)) }
-
-    LaunchedEffect(streamUrl) {
-        if (streamUrl == null) {
-            probe = RtspProbe(null, false)
-            return@LaunchedEffect
-        }
-
-        // The direct player owns this private TCP connection. Do not send RTSP OPTIONS to it.
-        if (parseSiyiDirectUrl(streamUrl) != null || parseRtspLowLatencyUrl(streamUrl) != null) {
-            probe = RtspProbe(null, false)
-            return@LaunchedEffect
-        }
-
-        val uri = URI(streamUrl)
-        val port = if (uri.port >= 0) uri.port else 554
-        val socketAddress =
-                withContext(Dispatchers.IO) {
-                    try {
-                        InetSocketAddress(uri.host, port)
-                    } catch (_: Exception) {
-                        null
-                    }
-                }
-
-        if (socketAddress == null) {
-            probe = RtspProbe(null, false)
-            return@LaunchedEffect
-        }
-
-        val pinger = RtspPinger(streamUrl, socketAddress)
-        var consecutiveFailures = 0
-
-        try {
-            while (isActive) {
-                val latency = withContext(Dispatchers.IO) { pinger.ping() }
-
-                if (latency == null) consecutiveFailures++ else consecutiveFailures = 0
-
-                probe =
-                        RtspProbe(
-                                latencyMs = latency,
-                                reachable = consecutiveFailures < PROBE_FAILURES_BEFORE_OFFLINE,
-                        )
-
-                delay(PROBE_INTERVAL_MS)
-            }
-        } finally {
-            withContext(NonCancellable + Dispatchers.IO) { pinger.close() }
-        }
-    }
-
-    return probe
 }
 
 @Composable
@@ -914,38 +720,18 @@ private fun CameraPanel(
         onClick: () -> Unit,
         content: @Composable BoxScope.() -> Unit = {},
 ) {
-    val probe = rememberRtspProbe(streamUrl)
-    val isSiyiDirect = parseSiyiDirectUrl(streamUrl.orEmpty()) != null
-    val isRtspUdp = parseRtspLowLatencyUrl(streamUrl.orEmpty()) != null
-    val isDirect = isSiyiDirect || isRtspUdp
-
     var playing by remember(streamUrl) { mutableStateOf(false) }
 
-    val online = streamUrl != null && (playing || (!isDirect && probe.reachable))
+    val online = streamUrl != null && playing
 
     Box(modifier = modifier.background(Background).clickable(onClick = onClick)) {
         if (streamUrl != null) {
-            // Rebuild on the 0/non-0 boundary: SurfaceView and TextureView are chosen at attach.
             key(streamUrl, rotation != 0) {
-                if (isSiyiDirect) {
-                    SiyiDirectCameraPreview(
-                            streamUrl = streamUrl,
-                            rotation = rotation,
-                            onPlayingChange = { playing = it },
-                    )
-                } else if (isRtspUdp) {
-                    RtspUdpCameraPreview(
-                            streamUrl = streamUrl,
-                            rotation = rotation,
-                            onPlayingChange = { playing = it },
-                    )
-                } else {
-                    RtspCameraPreview(
-                            streamUrl = streamUrl,
-                            rotation = rotation,
-                            onPlayingChange = { playing = it },
-                    )
-                }
+                RtspUdpCameraPreview(
+                        streamUrl = streamUrl,
+                        rotation = rotation,
+                        onPlayingChange = { playing = it },
+                )
             }
         } else {
             Text(
@@ -955,21 +741,6 @@ private fun CameraPanel(
                     fontFamily = FontFamily.Monospace,
                     modifier = Modifier.align(Alignment.Center),
             )
-        }
-
-        if (streamUrl != null && !isDirect && !playing && !probe.reachable) {
-            Box(
-                    modifier = Modifier.fillMaxSize().background(Background),
-                    contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                        "CAMERA OFFLINE",
-                        color = Red,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                )
-            }
         }
 
         Row(
@@ -985,163 +756,8 @@ private fun CameraPanel(
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace,
             )
-            if (isDirect) {
-                Text(
-                        "DIRECT",
-                        color = Green,
-                        fontSize = 8.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                )
-            }
-            probe.latencyMs?.let { latency ->
-                Text(
-                        "· ${latency}ms",
-                        color = MutedText,
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
-                )
-            }
         }
         content()
-    }
-}
-
-@Composable
-private fun RtspCameraPreview(
-        streamUrl: String,
-        rotation: Int = 0,
-        onPlayingChange: (Boolean) -> Unit = {},
-) {
-    val context = LocalContext.current
-    val mainHandler = remember { Handler(Looper.getMainLooper()) }
-
-    val libVlc = remember { Vlc.get(context) }
-    val mediaPlayer = remember(streamUrl) { MediaPlayer(libVlc) }
-
-    var errorMessage by remember(streamUrl) { mutableStateOf<String?>(null) }
-    var isPlaying by remember(streamUrl) { mutableStateOf(false) }
-
-    var attempt by remember(streamUrl) { mutableStateOf(0) }
-
-    var sourceAspect by remember(streamUrl) { mutableStateOf(16f / 9f) }
-
-    LaunchedEffect(isPlaying) { onPlayingChange(isPlaying) }
-
-    DisposableEffect(streamUrl) {
-        mediaPlayer.setEventListener { event ->
-            when (event.type) {
-                MediaPlayer.Event.Playing ->
-                        mainHandler.post {
-                            isPlaying = true
-                            errorMessage = null
-                        }
-                MediaPlayer.Event.Vout ->
-                        mainHandler.post {
-                            val track = mediaPlayer.currentVideoTrack
-
-                            if (track != null && track.width > 0 && track.height > 0) {
-                                sourceAspect = track.width.toFloat() / track.height.toFloat()
-                            }
-                            mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FILL)
-                            mediaPlayer.updateVideoSurfaces()
-                        }
-                MediaPlayer.Event.EncounteredError, MediaPlayer.Event.EndReached ->
-                        mainHandler.post {
-                            isPlaying = false
-                            errorMessage = "RECONNECTING..."
-                            attempt++
-                        }
-            }
-        }
-
-        onDispose {
-            mediaPlayer.setEventListener(null)
-            mediaPlayer.stop()
-            mediaPlayer.detachViews()
-            mediaPlayer.release()
-        }
-    }
-
-    LaunchedEffect(streamUrl, attempt) {
-        if (attempt > 0) delay(RECONNECT_BACKOFF_MS)
-
-        val media =
-                Media(libVlc, Uri.parse(streamUrl)).apply {
-                    setHWDecoderEnabled(true, false)
-                    addOption(":avcodec-skiploopfilter=4")
-                    addOption(":avcodec-skip-frame=0")
-                    addOption(":avcodec-fast")
-                    addOption(":mediacodec-dr=1")
-                    addOption(":network-caching=0")
-                    addOption(":avcodec-threads=1")
-                    addOption(":clock-synchro=-1")
-                    addOption(":clock-jitter=0")
-                    addOption(":no-audio")
-                    addOption(":no-rtsp-tcp")
-                }
-
-        mediaPlayer.media = media
-        media.release()
-
-        mediaPlayer.play()
-    }
-
-    BoxWithConstraints(
-            modifier = Modifier.fillMaxSize().background(Color.Black).clipToBounds(),
-            contentAlignment = Alignment.Center,
-    ) {
-        val swapped = rotation == 90 || rotation == 270
-
-        val displayAspect = if (swapped) 1f / sourceAspect else sourceAspect
-        val panelAspect = maxWidth / maxHeight
-
-        val wider = displayAspect > panelAspect
-        val screenWidth: Dp = if (wider) maxHeight * displayAspect else maxWidth
-        val screenHeight: Dp = if (wider) maxHeight else maxWidth / displayAspect
-
-        val videoModifier =
-                Modifier.requiredWidth(if (swapped) screenHeight else screenWidth)
-                        .requiredHeight(if (swapped) screenWidth else screenHeight)
-                        .graphicsLayer { rotationZ = rotation.toFloat() }
-
-        AndroidView(
-                factory = { ctx ->
-                    VLCVideoLayout(ctx).also { layout ->
-                        mediaPlayer.attachViews(layout, null, false, rotation != 0)
-                    }
-                },
-                modifier =
-                        videoModifier.onSizeChanged { size ->
-                            if (size.width > 0 && size.height > 0) {
-                                mainHandler.post { mediaPlayer.updateVideoSurfaces() }
-                            }
-                        },
-        )
-
-        if (!isPlaying && errorMessage == null) {
-            Text(
-                    text = "CONNECTING...",
-                    color = Color.White.copy(alpha = 0.5f),
-                    fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.align(Alignment.Center),
-            )
-        }
-
-        errorMessage?.let { message ->
-            Text(
-                    text = message,
-                    color = Red,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace,
-                    modifier =
-                            Modifier.align(Alignment.Center)
-                                    .background(Color.Black.copy(alpha = 0.5f))
-                                    .padding(4.dp),
-            )
-        }
     }
 }
 
@@ -1177,43 +793,6 @@ private interface PreviewPlayer {
     fun start()
 
     fun stop()
-}
-
-@Composable
-private fun SiyiDirectCameraPreview(
-        streamUrl: String,
-        rotation: Int = 0,
-        onPlayingChange: (Boolean) -> Unit = {},
-) {
-    val endpoint = remember(streamUrl) { parseSiyiDirectUrl(streamUrl) } ?: return
-
-    DirectSurfacePreview(
-            streamUrl = streamUrl,
-            rotation = rotation,
-            connectingLabel = "CONNECTING DIRECT...",
-            onPlayingChange = onPlayingChange,
-    ) { surface, callbacks ->
-        val player =
-                SiyiDirectPlayer(
-                        endpoint = endpoint,
-                        surface = surface,
-                        listener =
-                                object : SiyiDirectPlayer.Listener {
-                                    override fun onPlaying() = callbacks.onPlaying()
-
-                                    override fun onDecoderLatency(latencyMs: Long) =
-                                            callbacks.onLatency(latencyMs)
-
-                                    override fun onDisconnected(message: String) =
-                                            callbacks.onDisconnected("DIRECT STREAM RECONNECTING")
-                                },
-                )
-        object : PreviewPlayer {
-            override fun start() = player.start()
-
-            override fun stop() = player.stop()
-        }
-    }
 }
 
 @Composable
@@ -1373,19 +952,5 @@ private fun DirectSurfacePreview(
                 )
             }
         }
-    }
-}
-
-private fun toggleSiyiTransport(url: String?): String? {
-    if (url == null) return null
-    parseSiyiDirectUrl(url)?.let { endpoint ->
-        return "rtsp://${endpoint.host}:8554/main.264"
-    }
-
-    return try {
-        val host = URI(url).host ?: return null
-        "siyi://$host:37256"
-    } catch (_: Exception) {
-        null
     }
 }

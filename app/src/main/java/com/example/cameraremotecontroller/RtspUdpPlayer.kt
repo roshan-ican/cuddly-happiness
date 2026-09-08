@@ -6,6 +6,8 @@ import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import java.io.BufferedReader
@@ -142,6 +144,7 @@ internal class RtspUdpPlayer(
         private val endpoint: RtspEndpoint,
         private val surface: Surface,
         private val listener: Listener,
+        private val cropToSurface: Boolean = false,
 ) {
     interface Listener {
         fun onPlaying()
@@ -246,23 +249,8 @@ internal class RtspUdpPlayer(
         receiveVideo(rtpSocket, session, description, keepAliveMs)
     }
 
-    private fun bindRtpPair(): Pair<DatagramSocket, DatagramSocket> {
-        var port = RTP_PORT_BASE
-        while (port < RTP_PORT_BASE + RTP_PORT_RANGE) {
-            try {
-                val even = DatagramSocket(port)
-                try {
-                    val odd = DatagramSocket(port + 1)
-                    even.receiveBufferSize = RTP_RECEIVE_BUFFER
-                    return even to odd
-                } catch (_: Exception) {
-                    even.close()
-                }
-            } catch (_: Exception) {}
-            port += 2
-        }
-        error("No free RTP port pair")
-    }
+    private fun bindRtpPair(): Pair<DatagramSocket, DatagramSocket> =
+            bindFreshRtpPair(RTP_RECEIVE_BUFFER)
 
     private fun resolveControlUrl(control: String): String =
             when {
@@ -284,7 +272,7 @@ internal class RtspUdpPlayer(
                 } else {
                     RtpH265Depacketizer()
                 }
-        val decoder = LowLatencyVideoDecoder(description, surface, listener)
+        val decoder = LowLatencyVideoDecoder(description, surface, listener, cropToSurface)
         val buffer = ByteArray(MAX_DATAGRAM_SIZE)
         val packet = DatagramPacket(buffer, buffer.size)
         var lastKeepAlive = System.currentTimeMillis()
@@ -390,9 +378,11 @@ internal class RtspUdpPlayer(
             private val description: RtspVideoDescription,
             private val surface: Surface,
             private val listener: Listener,
+            private val cropToSurface: Boolean,
     ) : AutoCloseable {
         private val bufferInfo = MediaCodec.BufferInfo()
-        private var codec: MediaCodec = createCodec()
+        private val renderTimingHandler = Handler(renderCallbackThread.looper)
+        @Volatile private var codec: MediaCodec = createCodec()
         private var reportedPlaying = false
 
         private var statsWindowStart = System.currentTimeMillis()
@@ -403,7 +393,7 @@ internal class RtspUdpPlayer(
         private var droppedFrames = 0
         private var starvedInputs = 0
 
-        private fun createCodec(): MediaCodec {
+        private fun createCodec(tryVendorLowLatency: Boolean = true): MediaCodec {
             val format = MediaFormat.createVideoFormat(
                     description.mime,
                     description.width,
@@ -420,22 +410,63 @@ internal class RtspUdpPlayer(
             val lowLatencySupported = advertisesLowLatency(codecInfo)
             format.setInteger(KEY_LOW_LATENCY_COMPAT, 1)
 
-            return MediaCodec.createByCodecName(codecName).apply {
-                configure(format, surface, null, 0)
-                start()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !lowLatencySupported) {
-                    setParameters(
-                            Bundle().apply {
-                                putInt(MediaCodec.PARAMETER_KEY_LOW_LATENCY, 1)
-                            },
+            val decoder = MediaCodec.createByCodecName(codecName)
+            val vendorParameters = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                runCatching { decoder.supportedVendorParameters }.getOrDefault(emptyList())
+            } else emptyList()
+            // Older Qualcomm OMX builds implement this extension but return an empty
+            // vendor-parameter list. Retry without it if this decoder rejects it.
+            val vendorLowLatency = tryVendorLowLatency && (
+                    KEY_QTI_LOW_LATENCY in vendorParameters ||
+                            codecName.startsWith("OMX.qcom.", ignoreCase = true))
+            if (vendorLowLatency) format.setInteger(KEY_QTI_LOW_LATENCY, 1)
+            // Baseline AVC has no B-frames, so decode order is also display order.
+            // Do not apply this to Main/High AVC or HEVC, which may need reordering.
+            val decodeOrder = vendorLowLatency && description.mime == MediaFormat.MIMETYPE_VIDEO_AVC &&
+                    hasBaselineAvcSps(description.codecSpecificData)
+            if (decodeOrder) format.setInteger(KEY_QTI_DECODE_ORDER, 1)
+            try {
+                return decoder.apply {
+                    configure(format, surface, null, 0)
+                    start()
+                    var renderedCount = 0
+                    var renderedLatencySum = 0L
+                    var renderedLatencyMax = 0L
+                    setOnFrameRenderedListener({ callbackCodec, ptsUs, renderedNs ->
+                        if (callbackCodec !== codec) return@setOnFrameRenderedListener
+                        if (ptsUs > 0 && renderedNs >= ptsUs * 1_000) {
+                            val elapsedMs = (renderedNs / 1_000 - ptsUs) / 1_000
+                            renderedCount++
+                            renderedLatencySum += elapsedMs
+                            renderedLatencyMax = maxOf(renderedLatencyMax, elapsedMs)
+                            if (renderedCount >= 90) {
+                                Log.i(TAG, "${description.mime} submit-to-surface avg=${renderedLatencySum / renderedCount}ms max=${renderedLatencyMax}ms frames=$renderedCount")
+                                renderedCount = 0
+                                renderedLatencySum = 0
+                                renderedLatencyMax = 0
+                            }
+                        }
+                    }, renderTimingHandler)
+                    if (cropToSurface) setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !lowLatencySupported) {
+                        setParameters(
+                                Bundle().apply {
+                                    putInt(MediaCodec.PARAMETER_KEY_LOW_LATENCY, 1)
+                                },
+                        )
+                    }
+                    Log.i(
+                            TAG,
+                            "RTSP decoder $codecName hardware=${codecInfo.isHardwareAccelerated()} " +
+                                    "lowLatencyFeature=$lowLatencySupported sdk=${Build.VERSION.SDK_INT} " +
+                                    "vendorLowLatency=$vendorLowLatency decodeOrder=$decodeOrder csd=${description.codecSpecificData.size}B $description",
                     )
                 }
-                Log.i(
-                        TAG,
-                        "RTSP decoder $codecName hardware=${codecInfo.isHardwareAccelerated()} " +
-                                "lowLatencyFeature=$lowLatencySupported sdk=${Build.VERSION.SDK_INT} " +
-                                "csd=${description.codecSpecificData.size}B $description",
-                )
+            } catch (error: Exception) {
+                runCatching { decoder.release() }
+                if (!vendorLowLatency) throw error
+                Log.w(TAG, "$codecName rejected vendor low latency; retrying standard configuration", error)
+                return createCodec(tryVendorLowLatency = false)
             }
         }
 
@@ -449,6 +480,9 @@ internal class RtspUdpPlayer(
         fun offer(accessUnit: ByteArray) {
             if (accessUnit.isEmpty()) return
 
+            // Drain in step with arriving video. A free-running output thread can
+            // submit frames faster than SurfaceFlinger presents them and build a
+            // native display queue even when decoder latency itself looks low.
             renderNewestFrame()
 
             val inputIndex = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
@@ -476,21 +510,27 @@ internal class RtspUdpPlayer(
 
         private fun renderNewestFrame() {
             var newestIndex = -1
+            var newestPresentationTimeUs = 0L
             while (true) {
                 val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+                if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    if (cropToSurface) codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
+                    continue
+                }
                 if (outputIndex < 0) break
                 if (newestIndex >= 0) {
                     codec.releaseOutputBuffer(newestIndex, false)
                     droppedFrames++
                 }
                 newestIndex = outputIndex
+                newestPresentationTimeUs = bufferInfo.presentationTimeUs
             }
 
             if (newestIndex < 0) return
 
             codec.releaseOutputBuffer(newestIndex, true)
             val latencyMs =
-                    (System.nanoTime() / 1_000 - bufferInfo.presentationTimeUs)
+                    (System.nanoTime() / 1_000 - newestPresentationTimeUs)
                             .coerceAtLeast(0) / 1_000
             listener.onDecoderLatency(latencyMs)
             recordStats(latencyMs)
@@ -512,7 +552,7 @@ internal class RtspUdpPlayer(
 
             Log.i(
                     TAG,
-                    "decode frames=$statsFrames fps=${statsFrames * 1000 / elapsed} " +
+                    "${description.mime} decode frames=$statsFrames fps=${statsFrames * 1000 / elapsed} " +
                             "latency min=${statsLatencyMin}ms avg=${statsLatencySum / statsFrames}ms " +
                             "max=${statsLatencyMax}ms dropped=$droppedFrames starved=$starvedInputs",
             )
@@ -571,6 +611,9 @@ internal class RtspUdpPlayer(
     }
 
     private companion object {
+        val renderCallbackThread: HandlerThread by lazy {
+            HandlerThread("rtsp-render-events").apply { start() }
+        }
         const val TAG = "RtspUdp"
         const val CONNECT_TIMEOUT_MS = 2_000
         const val CONTROL_TIMEOUT_MS = 3_000
@@ -580,11 +623,11 @@ internal class RtspUdpPlayer(
         const val MAX_DATAGRAM_SIZE = 65_536
         const val MAX_ACCESS_UNIT_SIZE = 4 * 1024 * 1024
         const val RTP_RECEIVE_BUFFER = 512 * 1024
-        const val RTP_PORT_BASE = 40_000
-        const val RTP_PORT_RANGE = 200
         const val KEY_LOW_LATENCY_COMPAT = "low-latency"
         const val STATS_INTERVAL_MS = 3_000L
         const val INPUT_TIMEOUT_US = 4_000L
+        const val KEY_QTI_LOW_LATENCY = "vendor.qti-ext-dec-low-latency.enable"
+        const val KEY_QTI_DECODE_ORDER = "vendor.qti-ext-dec-picture-order.enable"
     }
 }
 

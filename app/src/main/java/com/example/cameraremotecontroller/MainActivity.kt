@@ -13,6 +13,11 @@ import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import android.graphics.SurfaceTexture
+import android.graphics.Outline
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.View
+import android.view.ViewOutlineProvider
 import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -814,6 +819,7 @@ private fun RtspUdpCameraPreview(
                 RtspUdpPlayer(
                         endpoint = endpoint,
                         surface = surface,
+                        cropToSurface = rotation == 0,
                         listener =
                                 object : RtspUdpPlayer.Listener {
                                     override fun onPlaying() = callbacks.onPlaying()
@@ -887,7 +893,9 @@ private fun DirectSurfacePreview(
                                 }
                             },
                             onLatency = { latency ->
-                                mainHandler.post { decoderLatencyMs = latency }
+                                if (SHOW_DECODE_LATENCY) {
+                                    mainHandler.post { decoderLatencyMs = latency }
+                                }
                             },
                             onDisconnected = { message ->
                                 mainHandler.post {
@@ -911,31 +919,61 @@ private fun DirectSurfacePreview(
             onPlayingChange(false)
         }
 
-        AndroidView(
-                factory = { context ->
-                    TextureView(context).also { view ->
-                        view.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                            private var outputSurface: Surface? = null
-
-                            override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
-                                outputSurface = Surface(texture).also { attach(it) }
-                            }
-
-                            override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
-
-                            override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
-                                detach()
-                                outputSurface?.release()
-                                outputSurface = null
-                                return true
-                            }
-
-                            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+        if (rotation == 0) {
+            // Keep the native surface exactly inside the pane. Let the decoder crop
+            // its image instead of enlarging a separate compositor layer beyond it.
+            AndroidView(
+                    factory = { context ->
+                        SurfaceView(context).also { view ->
+                            view.holder.addCallback(object : SurfaceHolder.Callback {
+                                override fun surfaceCreated(holder: SurfaceHolder) = attach(holder.surface)
+                                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+                                override fun surfaceDestroyed(holder: SurfaceHolder) = detach()
+                            })
                         }
-                    }
-                },
-                modifier = videoModifier,
-        )
+                    },
+                    update = { view ->
+                        // Compose zIndex alone cannot order native video surfaces.
+                        if (floating) view.setZOrderMediaOverlay(true)
+                        else view.setZOrderOnTop(false)
+                        val radius = if (floating) 8f * view.resources.displayMetrics.density else 0f
+                        view.outlineProvider = object : ViewOutlineProvider() {
+                            override fun getOutline(view: View, outline: Outline) {
+                                outline.setRoundRect(0, 0, view.width, view.height, radius)
+                            }
+                        }
+                        view.clipToOutline = true
+                        view.invalidateOutline()
+                    },
+                    modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            AndroidView(
+                    factory = { context ->
+                        TextureView(context).also { view ->
+                            view.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                                private var outputSurface: Surface? = null
+
+                                override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                                    outputSurface = Surface(texture).also { attach(it) }
+                                }
+
+                                override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
+
+                                override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                                    detach()
+                                    outputSurface?.release()
+                                    outputSurface = null
+                                    return true
+                                }
+
+                                override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+                            }
+                        }
+                    },
+                    modifier = videoModifier,
+            )
+        }
 
         if (!isPlaying) {
             Text(

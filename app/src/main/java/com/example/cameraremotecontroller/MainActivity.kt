@@ -12,8 +12,8 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.graphics.SurfaceTexture
+import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.core.AnimationSpec
@@ -25,7 +25,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -57,6 +56,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -375,49 +375,39 @@ fun ControllerDashboard() {
                                 else -> dockedBounds(docked.indexOfFirst { it.id == cam.id })
                             }
 
-                    val gestures =
-                            if (isFloat) {
-                                Modifier.pointerInput(cam.id) {
-                                    detectDragGestures(
-                                            onDragStart = { dragging = true },
-                                            onDragEnd = { settleFloat() },
-                                            onDragCancel = { settleFloat() },
-                                            onDrag = { change, amount ->
-                                                change.consume()
-                                                floatX += amount.x.toDp().value
-                                                floatY += amount.y.toDp().value
-                                            },
-                                    )
-                                }
-                            } else if (canFloat) {
-                                Modifier.pointerInput(cam.id, isMain) {
-                                    detectDragGesturesAfterLongPress(
-                                            onDragStart = { touch ->
-                                                floatX =
-                                                        bounds.x.value + touch.x.toDp().value -
-                                                                floatW.value / 2f
-                                                floatY =
-                                                        bounds.y.value + touch.y.toDp().value -
-                                                                floatH.value / 2f
-                                                stowedLeft = null
-                                                floatWasMain = isMain
-                                                if (isMain) {
-                                                    docked.firstOrNull()?.let { primaryId = it.id }
-                                                }
+                    fun minimize() {
+                        floatWasMain = isMain
+                        if (isMain) docked.firstOrNull()?.let { primaryId = it.id }
+                        floatingId = cam.id
+                        stowedLeft = null
+                        floatX = screenW.value - floatW.value - margin.value
+                        floatY = margin.value
+                    }
 
-                                                floatingId = cam.id
-                                                dragging = true
-                                            },
-                                            onDragEnd = { settleFloat() },
-                                            onDragCancel = { settleFloat() },
-                                            onDrag = { change, amount ->
-                                                change.consume()
-                                                floatX += amount.x.toDp().value
-                                                floatY += amount.y.toDp().value
-                                            },
-                                    )
-                                }
-                            } else Modifier
+                    // Keep the detector alive when the pane changes roles mid-gesture.
+                    val startDrag by rememberUpdatedState<(androidx.compose.ui.geometry.Offset) -> Unit>({ touch ->
+                        if (!isFloat) {
+                            minimize()
+                            floatX = bounds.x.value + touch.x / context.resources.displayMetrics.density - floatW.value / 2f
+                            floatY = bounds.y.value + touch.y / context.resources.displayMetrics.density - floatH.value / 2f
+                        }
+                        dragging = true
+                    })
+                    val finishDrag by rememberUpdatedState { settleFloat() }
+                    val gestures = if (canFloat) {
+                        Modifier.pointerInput(cam.id) {
+                            detectDragGestures(
+                                onDragStart = { startDrag(it) },
+                                onDragEnd = { finishDrag() },
+                                onDragCancel = { finishDrag() },
+                                onDrag = { change, amount ->
+                                    change.consume()
+                                    floatX += amount.x.toDp().value
+                                    floatY += amount.y.toDp().value
+                                },
+                            )
+                        }
+                    } else Modifier
 
                     val floatSkin =
                             if (isFloat)
@@ -438,7 +428,7 @@ fun ControllerDashboard() {
                             onClick = {
                                 when {
                                     isFloat -> dock()
-                                    !isMain -> primaryId = cam.id
+                                    canFloat -> minimize()
                                 }
                             },
                     )
@@ -732,7 +722,7 @@ private fun CameraPanel(
 
     val online = streamUrl != null && playing
 
-    Box(modifier = modifier.background(Background).clickable(onClick = onClick)) {
+    Box(modifier = modifier.clipToBounds().background(Background).clickable(onClick = onClick)) {
         if (streamUrl != null) {
             key(streamUrl, rotation != 0) {
                 RtspUdpCameraPreview(
@@ -874,8 +864,8 @@ private fun DirectSurfacePreview(
         val swapped = rotation == 90 || rotation == 270
         val displayAspect = if (swapped) 1f / sourceAspect else sourceAspect
         val panelAspect = maxWidth / maxHeight
-        // Cover fills the pane and relies on clipping; a floating SurfaceView is its own
-        // compositor layer that Compose cannot clip, so it has to fit inside instead.
+        // TextureView participates in pane clipping and stacking while moving or resizing.
+        // Fit the floating preview; fill the larger panes with the existing crop.
         val cover = if (floating) displayAspect < panelAspect else displayAspect > panelAspect
         val screenWidth: Dp = if (cover) maxHeight * displayAspect else maxWidth
         val screenHeight: Dp = if (cover) maxHeight else maxWidth / displayAspect
@@ -923,22 +913,25 @@ private fun DirectSurfacePreview(
 
         AndroidView(
                 factory = { context ->
-                    SurfaceView(context).also { view ->
-                        view.holder.addCallback(
-                                object : SurfaceHolder.Callback {
-                                    override fun surfaceCreated(holder: SurfaceHolder) =
-                                            attach(holder.surface)
+                    TextureView(context).also { view ->
+                        view.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                            private var outputSurface: Surface? = null
 
-                                    override fun surfaceChanged(
-                                            holder: SurfaceHolder,
-                                            format: Int,
-                                            width: Int,
-                                            height: Int,
-                                    ) = Unit
+                            override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                                outputSurface = Surface(texture).also { attach(it) }
+                            }
 
-                                    override fun surfaceDestroyed(holder: SurfaceHolder) = detach()
-                                }
-                        )
+                            override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
+
+                            override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                                detach()
+                                outputSurface?.release()
+                                outputSurface = null
+                                return true
+                            }
+
+                            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+                        }
                     }
                 },
                 modifier = videoModifier,

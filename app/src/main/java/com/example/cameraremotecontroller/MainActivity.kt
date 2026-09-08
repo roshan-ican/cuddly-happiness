@@ -936,14 +936,22 @@ private fun DirectSurfacePreview(
                         // Compose zIndex alone cannot order native video surfaces.
                         if (floating) view.setZOrderMediaOverlay(true)
                         else view.setZOrderOnTop(false)
-                        val radius = if (floating) 8f * view.resources.displayMetrics.density else 0f
-                        view.outlineProvider = object : ViewOutlineProvider() {
-                            override fun getOutline(view: View, outline: Outline) {
-                                outline.setRoundRect(0, 0, view.width, view.height, radius)
+                        // clipToOutline pushes the surface off the hardware overlay path, so
+                        // only the floating pane pays for it; a full pane has nothing to clip.
+                        if (floating) {
+                            val radius = 8f * view.resources.displayMetrics.density
+                            view.outlineProvider = object : ViewOutlineProvider() {
+                                override fun getOutline(view: View, outline: Outline) {
+                                    outline.setRoundRect(0, 0, view.width, view.height, radius)
+                                }
                             }
+                            view.clipToOutline = true
+                            view.invalidateOutline()
+                        } else if (view.clipToOutline) {
+                            view.outlineProvider = ViewOutlineProvider.BACKGROUND
+                            view.clipToOutline = false
+                            view.invalidateOutline()
                         }
-                        view.clipToOutline = true
-                        view.invalidateOutline()
                     },
                     modifier = Modifier.fillMaxSize(),
             )

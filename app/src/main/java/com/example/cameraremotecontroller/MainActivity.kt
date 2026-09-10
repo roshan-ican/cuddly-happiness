@@ -25,7 +25,8 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -65,6 +66,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
@@ -368,6 +370,9 @@ fun ControllerDashboard() {
                 key(cam.id) {
                     val isFloat = cam.id == floatingId
                     val isMain = !isFloat && cam.id == main?.id
+                    var videoTransform by remember(cam.id) { mutableStateOf(VideoTransform()) }
+                    var activePointers by remember(cam.id) { mutableStateOf(0) }
+                    var paneDragActive by remember(cam.id) { mutableStateOf(false) }
 
                     val bounds =
                             when {
@@ -395,20 +400,55 @@ fun ControllerDashboard() {
                         dragging = true
                     })
                     val finishDrag by rememberUpdatedState { settleFloat() }
-                    val gestures = if (canFloat) {
-                        Modifier.pointerInput(cam.id) {
-                            detectDragGestures(
-                                onDragStart = { startDrag(it) },
-                                onDragEnd = { finishDrag() },
-                                onDragCancel = { finishDrag() },
-                                onDrag = { change, amount ->
-                                    change.consume()
-                                    floatX += amount.x.toDp().value
-                                    floatY += amount.y.toDp().value
-                                },
-                            )
-                        }
-                    } else Modifier
+                    val currentTransform by rememberUpdatedState(videoTransform)
+                    val pointerTracker =
+                            Modifier.pointerInput(cam.id) {
+                                awaitPointerEventScope {
+                                    while (true) {
+                                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                                        val count = event.changes.count { it.pressed }
+                                        if (activePointers > 0 && count == 0 && paneDragActive) {
+                                            paneDragActive = false
+                                            finishDrag()
+                                        }
+                                        activePointers = count
+                                    }
+                                }
+                            }
+                    val transformGestures =
+                            Modifier.pointerInput(cam.id, cam.rotation) {
+                                detectTransformGestures { centroid, pan, zoom, _ ->
+                                    val before = currentTransform
+                                    if (activePointers >= 2 || zoom != 1f || before.scale > 1f) {
+                                        if (paneDragActive) {
+                                            paneDragActive = false
+                                            finishDrag()
+                                        }
+                                        val normalizedX = pan.x / size.width.coerceAtLeast(1)
+                                        val normalizedY = pan.y / size.height.coerceAtLeast(1)
+                                        val rotated =
+                                                rotateGestureIntoVideo(
+                                                        cam.rotation,
+                                                        normalizedX,
+                                                        normalizedY,
+                                                )
+                                        videoTransform =
+                                                updateVideoTransform(
+                                                        before,
+                                                        zoom,
+                                                        rotated.first,
+                                                        rotated.second,
+                                                )
+                                    } else if (canFloat) {
+                                        if (!paneDragActive) {
+                                            startDrag(centroid)
+                                            paneDragActive = true
+                                        }
+                                        floatX += pan.x.toDp().value
+                                        floatY += pan.y.toDp().value
+                                    }
+                                }
+                            }
 
                     val floatSkin =
                             if (isFloat)
@@ -420,18 +460,21 @@ fun ControllerDashboard() {
                             cameraName = cam.name,
                             modifier =
                                     paneModifier(bounds, animate = !(isFloat && dragging))
-                                            .zIndex(if (isFloat) 2f else 0f)
-                                            .then(floatSkin)
-                                            .then(gestures),
+                                             .zIndex(if (isFloat) 2f else 0f)
+                                             .then(floatSkin)
+                                             .then(pointerTracker)
+                                             .then(transformGestures),
                             streamUrl = cam.url,
                             rotation = cam.rotation,
                             floating = isFloat,
+                            videoTransform = videoTransform,
                             onClick = {
                                 when {
                                     isFloat -> dock()
                                     canFloat -> minimize()
                                 }
                             },
+                            onDoubleClick = { videoTransform = VideoTransform() },
                     )
                 }
             }
@@ -716,20 +759,29 @@ private fun CameraPanel(
         streamUrl: String?,
         rotation: Int = 0,
         floating: Boolean = false,
+        videoTransform: VideoTransform = VideoTransform(),
         onClick: () -> Unit,
+        onDoubleClick: () -> Unit = {},
         content: @Composable BoxScope.() -> Unit = {},
 ) {
     var playing by remember(streamUrl) { mutableStateOf(false) }
 
     val online = streamUrl != null && playing
 
-    Box(modifier = modifier.clipToBounds().background(Background).clickable(onClick = onClick)) {
+    Box(
+            modifier =
+                    modifier.clipToBounds().background(Background).combinedClickable(
+                            onClick = onClick,
+                            onDoubleClick = onDoubleClick,
+                    ),
+    ) {
         if (streamUrl != null) {
             key(streamUrl, rotation != 0) {
                 RtspUdpCameraPreview(
                         streamUrl = streamUrl,
                         rotation = rotation,
                         floating = floating,
+                        videoTransform = videoTransform,
                         onPlayingChange = { playing = it },
                 )
             }
@@ -800,6 +852,7 @@ private fun RtspUdpCameraPreview(
         streamUrl: String,
         rotation: Int = 0,
         floating: Boolean = false,
+        videoTransform: VideoTransform = VideoTransform(),
         onPlayingChange: (Boolean) -> Unit = {},
 ) {
     val endpoint = remember(streamUrl) { parseRtspLowLatencyUrl(streamUrl) } ?: return
@@ -808,6 +861,7 @@ private fun RtspUdpCameraPreview(
             streamUrl = streamUrl,
             rotation = rotation,
             floating = floating,
+            videoTransform = videoTransform,
             connectingLabel = "CONNECTING RTSP/UDP...",
             onPlayingChange = onPlayingChange,
     ) { surface, callbacks ->
@@ -840,6 +894,7 @@ private fun DirectSurfacePreview(
         streamUrl: String,
         rotation: Int,
         floating: Boolean,
+        videoTransform: VideoTransform,
         connectingLabel: String,
         onPlayingChange: (Boolean) -> Unit,
         createPlayer: (Surface, PreviewCallbacks) -> PreviewPlayer,
@@ -909,7 +964,13 @@ private fun DirectSurfacePreview(
                     }
                 },
                 update = { view ->
-                    view.setVideoTransform(rotation, fill = !floating)
+                    view.setVideoTransform(
+                            rotationDegrees = rotation,
+                            fill = !floating,
+                            scale = videoTransform.scale,
+                            panX = videoTransform.panX,
+                            panY = videoTransform.panY,
+                    )
                     if (floating) view.setZOrderMediaOverlay(true)
                     else view.setZOrderOnTop(false)
                     if (floating) {

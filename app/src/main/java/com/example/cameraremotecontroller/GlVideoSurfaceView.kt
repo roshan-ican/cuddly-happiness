@@ -5,6 +5,7 @@ import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.opengl.Matrix
 import android.view.Surface
 import android.view.SurfaceHolder
 import java.nio.ByteBuffer
@@ -26,9 +27,18 @@ internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
         renderMode = RENDERMODE_WHEN_DIRTY
     }
 
-    fun setVideoTransform(rotationDegrees: Int, fill: Boolean) {
+    fun setVideoTransform(
+            rotationDegrees: Int,
+            fill: Boolean,
+            scale: Float,
+            panX: Float,
+            panY: Float,
+    ) {
         videoRenderer.rotationDegrees = ((rotationDegrees % 360) + 360) % 360
         videoRenderer.fill = fill
+        videoRenderer.scale = scale
+        videoRenderer.panX = panX
+        videoRenderer.panY = panY
         requestRender()
     }
 
@@ -42,6 +52,9 @@ internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
     private inner class VideoRenderer : Renderer, SurfaceTexture.OnFrameAvailableListener {
         @Volatile var rotationDegrees = 0
         @Volatile var fill = true
+        @Volatile var scale = 1f
+        @Volatile var panX = 0f
+        @Volatile var panY = 0f
 
         private var program = 0
         private var textureId = 0
@@ -50,7 +63,16 @@ internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
         private var frameAvailable = false
         private val frameLock = Any()
         private val textureMatrix = FloatArray(16)
-        private val vertices = floatBuffer(FloatArray(16))
+        private val positionMatrix = FloatArray(16)
+        private val vertices =
+                floatBuffer(
+                        floatArrayOf(
+                                -1f, -1f, 0f, 0f,
+                                1f, -1f, 1f, 0f,
+                                -1f, 1f, 0f, 1f,
+                                1f, 1f, 1f, 1f,
+                        ),
+                )
 
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
             releaseOutputSurface()
@@ -101,12 +123,17 @@ internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
                 scaleX = if (videoAspect > viewAspect) 1f else videoAspect / viewAspect
                 scaleY = if (videoAspect > viewAspect) viewAspect / videoAspect else 1f
             }
-            updateVertices(scaleX, scaleY, rotationDegrees)
+            Matrix.setIdentityM(positionMatrix, 0)
+            Matrix.scaleM(positionMatrix, 0, scaleX, scaleY, 1f)
+            Matrix.rotateM(positionMatrix, 0, -rotationDegrees.toFloat(), 0f, 0f, 1f)
+            Matrix.translateM(positionMatrix, 0, 2f * panX, -2f * panY, 0f)
+            Matrix.scaleM(positionMatrix, 0, scale, scale, 1f)
 
             GLES20.glUseProgram(program)
             val position = GLES20.glGetAttribLocation(program, "aPosition")
             val textureCoordinate = GLES20.glGetAttribLocation(program, "aTextureCoordinate")
-            val matrix = GLES20.glGetUniformLocation(program, "uTextureMatrix")
+            val positionTransform = GLES20.glGetUniformLocation(program, "uPositionMatrix")
+            val textureTransform = GLES20.glGetUniformLocation(program, "uTextureMatrix")
 
             vertices.position(0)
             GLES20.glEnableVertexAttribArray(position)
@@ -114,7 +141,8 @@ internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
             vertices.position(2)
             GLES20.glEnableVertexAttribArray(textureCoordinate)
             GLES20.glVertexAttribPointer(textureCoordinate, 2, GLES20.GL_FLOAT, false, 16, vertices)
-            GLES20.glUniformMatrix4fv(matrix, 1, false, textureMatrix, 0)
+            GLES20.glUniformMatrix4fv(positionTransform, 1, false, positionMatrix, 0)
+            GLES20.glUniformMatrix4fv(textureTransform, 1, false, textureMatrix, 0)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
@@ -132,26 +160,6 @@ internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
             outputSurface = null
             surfaceTexture?.release()
             surfaceTexture = null
-        }
-
-        private fun updateVertices(scaleX: Float, scaleY: Float, rotation: Int) {
-            val textureCoordinates =
-                    when (rotation) {
-                        90 -> floatArrayOf(0f, 1f, 0f, 0f, 1f, 1f, 1f, 0f)
-                        180 -> floatArrayOf(1f, 1f, 0f, 1f, 1f, 0f, 0f, 0f)
-                        270 -> floatArrayOf(1f, 0f, 1f, 1f, 0f, 0f, 0f, 1f)
-                        else -> floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
-                    }
-            val data =
-                    floatArrayOf(
-                            -scaleX, -scaleY, textureCoordinates[0], textureCoordinates[1],
-                            scaleX, -scaleY, textureCoordinates[2], textureCoordinates[3],
-                            -scaleX, scaleY, textureCoordinates[4], textureCoordinates[5],
-                            scaleX, scaleY, textureCoordinates[6], textureCoordinates[7],
-                    )
-            vertices.position(0)
-            vertices.put(data)
-            vertices.position(0)
         }
 
         private fun createExternalTexture(): Int {
@@ -193,12 +201,13 @@ internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
     private companion object {
         val VERTEX_SHADER =
                 """
+                uniform mat4 uPositionMatrix;
                 uniform mat4 uTextureMatrix;
                 attribute vec4 aPosition;
                 attribute vec4 aTextureCoordinate;
                 varying vec2 vTextureCoordinate;
                 void main() {
-                    gl_Position = aPosition;
+                    gl_Position = uPositionMatrix * aPosition;
                     vTextureCoordinate = (uTextureMatrix * aTextureCoordinate).xy;
                 }
                 """.trimIndent()

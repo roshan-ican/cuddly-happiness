@@ -417,10 +417,14 @@ internal class RtspUdpPlayer(
                     KEY_QTI_LOW_LATENCY in vendorParameters ||
                             codecName.startsWith("OMX.qcom.", ignoreCase = true))
             if (vendorLowLatency) format.setInteger(KEY_QTI_LOW_LATENCY, 1)
-            // Baseline AVC has no B-frames, so decode order is also display order.
-            // Do not apply this to Main/High AVC or HEVC, which may need reordering.
-            val decodeOrder = vendorLowLatency && description.mime == MediaFormat.MIMETYPE_VIDEO_AVC &&
-                    hasBaselineAvcSps(description.codecSpecificData)
+            // Only safe where the stream carries no reordering, so decode order is display order.
+            val reorderPics = if (description.mime == MediaFormat.MIMETYPE_VIDEO_HEVC) {
+                hevcMaxNumReorderPics(description.codecSpecificData)
+            } else null
+            val decodeOrder = vendorLowLatency && when (description.mime) {
+                MediaFormat.MIMETYPE_VIDEO_AVC -> hasBaselineAvcSps(description.codecSpecificData)
+                else -> reorderPics == 0
+            }
             if (decodeOrder) format.setInteger(KEY_QTI_DECODE_ORDER, 1)
             try {
                 return decoder.apply {
@@ -449,7 +453,8 @@ internal class RtspUdpPlayer(
                             TAG,
                             "RTSP decoder $codecName hardware=${codecInfo.isHardwareAccelerated()} " +
                                     "lowLatencyFeature=$lowLatencySupported sdk=${Build.VERSION.SDK_INT} " +
-                                    "vendorLowLatency=$vendorLowLatency decodeOrder=$decodeOrder csd=${description.codecSpecificData.size}B $description",
+                                    "vendorLowLatency=$vendorLowLatency decodeOrder=$decodeOrder " +
+                                    "maxNumReorderPics=$reorderPics csd=${description.codecSpecificData.size}B $description",
                     )
                 }
             } catch (error: Exception) {

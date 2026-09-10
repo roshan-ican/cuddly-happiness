@@ -5,7 +5,6 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -408,8 +407,6 @@ internal class RtspUdpPlayer(
             val codecInfo = selectDecoder()
             val codecName = codecInfo.name
             val lowLatencySupported = advertisesLowLatency(codecInfo)
-            format.setInteger(KEY_LOW_LATENCY_COMPAT, 1)
-
             val decoder = MediaCodec.createByCodecName(codecName)
             val vendorParameters = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 runCatching { decoder.supportedVendorParameters }.getOrDefault(emptyList())
@@ -448,13 +445,6 @@ internal class RtspUdpPlayer(
                         }
                     }, renderTimingHandler)
                     if (cropToSurface) setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !lowLatencySupported) {
-                        setParameters(
-                                Bundle().apply {
-                                    putInt(MediaCodec.PARAMETER_KEY_LOW_LATENCY, 1)
-                                },
-                        )
-                    }
                     Log.i(
                             TAG,
                             "RTSP decoder $codecName hardware=${codecInfo.isHardwareAccelerated()} " +
@@ -623,7 +613,6 @@ internal class RtspUdpPlayer(
         const val MAX_DATAGRAM_SIZE = 65_536
         const val MAX_ACCESS_UNIT_SIZE = 4 * 1024 * 1024
         const val RTP_RECEIVE_BUFFER = 512 * 1024
-        const val KEY_LOW_LATENCY_COMPAT = "low-latency"
         const val STATS_INTERVAL_MS = 3_000L
         const val INPUT_TIMEOUT_US = 4_000L
         const val KEY_QTI_LOW_LATENCY = "vendor.qti-ext-dec-low-latency.enable"

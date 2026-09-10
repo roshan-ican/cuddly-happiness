@@ -12,13 +12,9 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.Surface
-import android.graphics.SurfaceTexture
 import android.graphics.Outline
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.view.View
 import android.view.ViewOutlineProvider
-import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.core.AnimationSpec
@@ -819,7 +815,7 @@ private fun RtspUdpCameraPreview(
                 RtspUdpPlayer(
                         endpoint = endpoint,
                         surface = surface,
-                        cropToSurface = rotation == 0,
+                        cropToSurface = false,
                         listener =
                                 object : RtspUdpPlayer.Listener {
                                     override fun onPlaying() = callbacks.onPlaying()
@@ -866,20 +862,6 @@ private fun DirectSurfacePreview(
             modifier = Modifier.fillMaxSize().background(Color.Black).clipToBounds(),
             contentAlignment = Alignment.Center,
     ) {
-        val sourceAspect = 16f / 9f
-        val swapped = rotation == 90 || rotation == 270
-        val displayAspect = if (swapped) 1f / sourceAspect else sourceAspect
-        val panelAspect = maxWidth / maxHeight
-        // TextureView participates in pane clipping and stacking while moving or resizing.
-        // Fit the floating preview; fill the larger panes with the existing crop.
-        val cover = if (floating) displayAspect < panelAspect else displayAspect > panelAspect
-        val screenWidth: Dp = if (cover) maxHeight * displayAspect else maxWidth
-        val screenHeight: Dp = if (cover) maxHeight else maxWidth / displayAspect
-        val videoModifier =
-                Modifier.requiredWidth(if (swapped) screenHeight else screenWidth)
-                        .requiredHeight(if (swapped) screenWidth else screenHeight)
-                        .graphicsLayer { rotationZ = rotation.toFloat() }
-
         fun attach(surface: Surface) {
             val callbacks =
                     PreviewCallbacks(
@@ -919,69 +901,34 @@ private fun DirectSurfacePreview(
             onPlayingChange(false)
         }
 
-        if (rotation == 0) {
-            // Keep the native surface exactly inside the pane. Let the decoder crop
-            // its image instead of enlarging a separate compositor layer beyond it.
-            AndroidView(
-                    factory = { context ->
-                        SurfaceView(context).also { view ->
-                            view.holder.addCallback(object : SurfaceHolder.Callback {
-                                override fun surfaceCreated(holder: SurfaceHolder) = attach(holder.surface)
-                                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
-                                override fun surfaceDestroyed(holder: SurfaceHolder) = detach()
-                            })
-                        }
-                    },
-                    update = { view ->
-                        // Compose zIndex alone cannot order native video surfaces.
-                        if (floating) view.setZOrderMediaOverlay(true)
-                        else view.setZOrderOnTop(false)
-                        // clipToOutline pushes the surface off the hardware overlay path, so
-                        // only the floating pane pays for it; a full pane has nothing to clip.
-                        if (floating) {
-                            val radius = 8f * view.resources.displayMetrics.density
-                            view.outlineProvider = object : ViewOutlineProvider() {
-                                override fun getOutline(view: View, outline: Outline) {
-                                    outline.setRoundRect(0, 0, view.width, view.height, radius)
-                                }
-                            }
-                            view.clipToOutline = true
-                            view.invalidateOutline()
-                        } else if (view.clipToOutline) {
-                            view.outlineProvider = ViewOutlineProvider.BACKGROUND
-                            view.clipToOutline = false
-                            view.invalidateOutline()
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize(),
-            )
-        } else {
-            AndroidView(
-                    factory = { context ->
-                        TextureView(context).also { view ->
-                            view.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                                private var outputSurface: Surface? = null
-
-                                override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
-                                    outputSurface = Surface(texture).also { attach(it) }
-                                }
-
-                                override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
-
-                                override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
-                                    detach()
-                                    outputSurface?.release()
-                                    outputSurface = null
-                                    return true
-                                }
-
-                                override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+        AndroidView(
+                factory = { context ->
+                    GlVideoSurfaceView(context).also { view ->
+                        view.onOutputSurfaceAvailable = ::attach
+                        view.onOutputSurfaceDestroyed = ::detach
+                    }
+                },
+                update = { view ->
+                    view.setVideoTransform(rotation, fill = !floating)
+                    if (floating) view.setZOrderMediaOverlay(true)
+                    else view.setZOrderOnTop(false)
+                    if (floating) {
+                        val radius = 8f * view.resources.displayMetrics.density
+                        view.outlineProvider = object : ViewOutlineProvider() {
+                            override fun getOutline(view: View, outline: Outline) {
+                                outline.setRoundRect(0, 0, view.width, view.height, radius)
                             }
                         }
-                    },
-                    modifier = videoModifier,
-            )
-        }
+                        view.clipToOutline = true
+                        view.invalidateOutline()
+                    } else if (view.clipToOutline) {
+                        view.outlineProvider = ViewOutlineProvider.BACKGROUND
+                        view.clipToOutline = false
+                        view.invalidateOutline()
+                    }
+                },
+                modifier = Modifier.fillMaxSize(),
+        )
 
         if (!isPlaying) {
             Text(

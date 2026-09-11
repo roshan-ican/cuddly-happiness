@@ -17,6 +17,7 @@ import javax.microedition.khronos.opengles.GL10
 internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
     private val videoRenderer = VideoRenderer()
     @Volatile private var surfaceGeneration = 0
+    private var floatingLayer: Boolean? = null
 
     var onOutputSurfaceAvailable: ((Surface) -> Unit)? = null
     var onOutputSurfaceDestroyed: (() -> Unit)? = null
@@ -25,6 +26,12 @@ internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
         setEGLContextClientVersion(2)
         setRenderer(videoRenderer)
         renderMode = RENDERMODE_WHEN_DIRTY
+    }
+
+    fun setFloatingLayer(floating: Boolean) {
+        if (floatingLayer == floating) return
+        floatingLayer = floating
+        setZOrderOnTop(floating)
     }
 
     fun setVideoTransform(
@@ -40,6 +47,14 @@ internal class GlVideoSurfaceView(context: Context) : GLSurfaceView(context) {
         videoRenderer.panX = panX
         videoRenderer.panY = panY
         requestRender()
+    }
+
+    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
+        super.onSizeChanged(width, height, oldWidth, oldHeight)
+        if (width != oldWidth || height != oldHeight) {
+            queueEvent { GLES20.glViewport(0, 0, width, height) }
+            requestRender()
+        }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {

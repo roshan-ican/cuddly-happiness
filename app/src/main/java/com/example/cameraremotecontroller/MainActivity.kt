@@ -25,6 +25,7 @@ import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -44,6 +45,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredHeight
@@ -107,6 +109,8 @@ import androidx.compose.ui.zIndex
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.example.cameraremotecontroller.ui.theme.CameraRemoteControllerTheme
 import java.util.Locale
 import kotlin.math.abs
@@ -312,6 +316,7 @@ fun ControllerDashboard() {
 
     var primaryId by remember { mutableStateOf(cameras.firstOrNull()?.id ?: 0) }
     var showSettings by remember { mutableStateOf(false) }
+    var showRcChannels by remember { mutableStateOf(false) }
     var layoutMode by remember {
         mutableStateOf(
                 prefs.getString(PREFS_KEY_LAYOUT, null)?.let {
@@ -693,6 +698,15 @@ fun ControllerDashboard() {
                     modifier = Modifier.align(Alignment.TopEnd).padding(11.dp).zIndex(4f),
                     onClick = { showSettings = true },
             )
+            RcChannelsButton(
+                    modifier = Modifier.align(Alignment.TopEnd).padding(top = 11.dp, end = 47.dp).zIndex(4f),
+                    onClick = { showRcChannels = true },
+            )
+            RcControlsLayer(
+                    showMonitor = showRcChannels,
+                    onDismissMonitor = { showRcChannels = false },
+                    modifier = Modifier.fillMaxSize().zIndex(4f),
+            )
             if (pageCount > 1) {
                 PageSelector(
                         page = pageIndex,
@@ -755,6 +769,7 @@ fun ControllerDashboard() {
                 },
         )
     }
+
 }
 
 private data class PaneBounds(val x: Dp, val y: Dp, val w: Dp, val h: Dp)
@@ -1109,6 +1124,288 @@ private fun SettingsButton(modifier: Modifier, onClick: () -> Unit) {
                             .clickable(onClick = onClick),
             contentAlignment = Alignment.Center,
     ) { Text("⚙", color = MutedText, fontSize = 14.sp) }
+}
+
+@Composable
+private fun RcChannelsButton(modifier: Modifier, onClick: () -> Unit) {
+    Box(
+            modifier =
+                    modifier.height(28.dp)
+                            .wrapContentWidth()
+                            .background(color = HeaderBackground, shape = RoundedCornerShape(14.dp))
+                            .clickable(onClick = onClick)
+                            .padding(horizontal = 10.dp),
+            contentAlignment = Alignment.Center,
+    ) {
+        Text("RC", color = MutedText, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun RcControlsLayer(
+        showMonitor: Boolean,
+        onDismissMonitor: () -> Unit,
+        modifier: Modifier = Modifier,
+) {
+    var state by remember { mutableStateOf(SiyiRcChannelState()) }
+    val client = remember { SiyiRcChannelClient { state = it } }
+    val context = LocalContext.current
+
+    DisposableEffect(client, context) {
+        val lifecycle = (context as ComponentActivity).lifecycle
+        val observer =
+                LifecycleEventObserver { _, event ->
+                    when (event) {
+                        Lifecycle.Event.ON_START -> client.start()
+                        Lifecycle.Event.ON_STOP -> client.stop()
+                        else -> Unit
+                    }
+                }
+        lifecycle.addObserver(observer)
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) client.start()
+        onDispose {
+            lifecycle.removeObserver(observer)
+            client.stop()
+        }
+    }
+
+    Box(modifier = modifier) {
+        RcJoystickOverlay(state = state, modifier = Modifier.align(Alignment.BottomCenter))
+        RcButtonRail(
+                labels = listOf("L1", "L2", "L3"),
+                values = state.channels.subList(8, 11),
+                modifier = Modifier.align(Alignment.CenterStart).padding(start = 18.dp),
+        )
+        RcButtonRail(
+                labels = listOf("R1", "R2", "R3"),
+                values = state.channels.subList(11, 14),
+                modifier = Modifier.align(Alignment.CenterEnd).padding(end = 18.dp),
+        )
+        Row(
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 52.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            RcButtonIndicator("S1", state.channels[14])
+            RcButtonIndicator("S2", state.channels[15])
+        }
+    }
+    if (showMonitor) RcChannelsDialog(state = state, onDismiss = onDismissMonitor)
+}
+
+@Composable
+private fun RcButtonRail(
+        labels: List<String>,
+        values: List<Int>,
+        modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        labels.forEachIndexed { index, label -> RcButtonIndicator(label, values[index]) }
+    }
+}
+
+@Composable
+private fun RcButtonIndicator(label: String, value: Int) {
+    val active = value >= 1750
+    Row(
+            modifier =
+                    Modifier.width(58.dp)
+                            .height(28.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(
+                                    if (active) Green.copy(alpha = 0.9f)
+                                    else Color.Black.copy(alpha = 0.52f)
+                            )
+                            .border(
+                                    1.dp,
+                                    if (active) Green else Color.White.copy(alpha = 0.24f),
+                                    RoundedCornerShape(8.dp),
+                            )
+                            .padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+                label,
+                color = if (active) Color.Black else Color.White.copy(alpha = 0.72f),
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+        )
+        Box(
+                Modifier.size(5.dp)
+                        .clip(CircleShape)
+                        .background(if (active) Color.Black.copy(alpha = 0.7f) else SettingsSecondary)
+        )
+    }
+}
+
+@Composable
+private fun RcJoystickOverlay(state: SiyiRcChannelState, modifier: Modifier = Modifier) {
+    Row(
+            modifier = modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 18.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Bottom,
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Bottom) {
+            RcJoystickIndicator("MAIN L", state.channels[3], state.channels[2], 76.dp)
+            RcJoystickIndicator("MINI L", state.channels[6], state.channels[7], 58.dp)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Bottom) {
+            RcJoystickIndicator("MINI R", state.channels[5], state.channels[4], 58.dp)
+            RcJoystickIndicator(
+                    "MAIN R",
+                    state.channels[0],
+                    state.channels[1],
+                    76.dp,
+                    invertVertical = false,
+            )
+        }
+    }
+}
+
+@Composable
+private fun RcJoystickIndicator(
+        label: String,
+        horizontal: Int,
+        vertical: Int,
+        size: Dp,
+        invertVertical: Boolean = true,
+) {
+    val x = if (horizontal == 0) 0f else ((horizontal - 1500) / 450f).coerceIn(-1f, 1f)
+    val rawY = if (vertical == 0) 0f else ((vertical - 1500) / 450f).coerceIn(-1f, 1f)
+    val y = if (invertVertical) -rawY else rawY
+    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Canvas(modifier = Modifier.size(size)) {
+            val radius = this.size.minDimension / 2f
+            val travel = radius * 0.52f
+            drawCircle(Color.Black.copy(alpha = 0.52f), radius)
+            drawCircle(Color.White.copy(alpha = 0.26f), radius, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5.dp.toPx()))
+            drawLine(Color.White.copy(alpha = 0.18f), androidx.compose.ui.geometry.Offset(radius, radius * 0.3f), androidx.compose.ui.geometry.Offset(radius, radius * 1.7f), 1.dp.toPx())
+            drawLine(Color.White.copy(alpha = 0.18f), androidx.compose.ui.geometry.Offset(radius * 0.3f, radius), androidx.compose.ui.geometry.Offset(radius * 1.7f, radius), 1.dp.toPx())
+            drawCircle(
+                    if (horizontal == 0 || vertical == 0) SettingsSecondary else Green,
+                    radius * 0.22f,
+                    androidx.compose.ui.geometry.Offset(radius + x * travel, radius + y * travel),
+            )
+        }
+        Text(
+                label,
+                color = Color.White.copy(alpha = 0.72f),
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.4.sp,
+                modifier = Modifier.background(Color.Black.copy(alpha = 0.42f), RoundedCornerShape(5.dp)).padding(horizontal = 5.dp, vertical = 2.dp),
+        )
+    }
+}
+
+@Composable
+private fun RcChannelsDialog(state: SiyiRcChannelState, onDismiss: () -> Unit) {
+    Dialog(
+            onDismissRequest = onDismiss,
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        val configuration = LocalConfiguration.current
+        val shape = RoundedCornerShape(20.dp)
+        val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+
+        LaunchedEffect(dialogWindow) {
+            dialogWindow?.let { window ->
+                WindowInsetsControllerCompat(window, window.decorView).apply {
+                    hide(WindowInsetsCompat.Type.systemBars())
+                    systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+        }
+
+        Column(
+                modifier =
+                        Modifier.padding(24.dp)
+                                .widthIn(max = 620.dp)
+                                .fillMaxWidth()
+                                .clip(shape)
+                                .background(SettingsSurface)
+                                .border(0.5.dp, Color.White.copy(alpha = 0.08f), shape)
+                                .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("RC Input Test", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                            when {
+                                state.connected -> "Connected · ${state.packetCount} packets"
+                                state.error != null -> state.error!!
+                                else -> "Connecting to 192.168.144.20:19856…"
+                            },
+                            color = if (state.connected) Green else SettingsSecondary,
+                            fontSize = 12.sp,
+                    )
+                }
+                Text(
+                        "Done",
+                        color = Green,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.pressable(onClick = onDismiss).padding(10.dp),
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                    repeat(8) { index -> RcChannelRow(index, state.channels[index]) }
+                }
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                    repeat(8) { offset ->
+                        val index = offset + 8
+                        RcChannelRow(index, state.channels[index])
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RcChannelRow(index: Int, value: Int) {
+    val normalized = if (value == 0) 0f else ((value - 1000) / 1000f).coerceIn(0f, 1f)
+    Row(
+            modifier =
+                    Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(SettingsCard)
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+                "CH${index + 1}",
+                color = SettingsSecondary,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.width(34.dp),
+        )
+        Box(
+                modifier =
+                        Modifier.weight(1f)
+                                .height(5.dp)
+                                .clip(RoundedCornerShape(3.dp))
+                                .background(SettingsSeparator),
+        ) {
+            Box(
+                    Modifier.fillMaxWidth(normalized)
+                            .fillMaxHeight()
+                            .background(if (value == 0) SettingsSeparator else Green)
+            )
+        }
+        Text(
+                if (value == 0) "—" else value.toString(),
+                color = if (value == 0) SettingsSecondary else Color.White,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+                textAlign = TextAlign.End,
+                modifier = Modifier.width(34.dp),
+        )
+    }
 }
 
 @Composable

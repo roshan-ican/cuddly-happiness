@@ -119,8 +119,8 @@ import kotlin.math.roundToInt
 // private const val CAM2_URL = "rtsp://10.252.176.114:8555/main.264"
 
 // Real Camera URLs (Uncomment and use when phone is directly on the camera network)
-private const val CAM1_URL = "rtspll://192.168.144.25:8554/main.264"
-private const val CAM2_URL = "rtspll://192.168.144.26:8554/main.264"
+private const val CAM1_URL = "rtsp://192.168.144.25:8554/main.264"
+private const val CAM2_URL = "rtsp://192.168.144.26:8554/main.264"
 
 private data class CameraSource(
         val id: Int,
@@ -184,17 +184,18 @@ private fun normalizeCameraUrl(input: String): String? {
     val trimmed = input.trim()
     if (trimmed.isEmpty()) return null
 
-    // Everything lands on rtspll://: it is the only player left.
+    // Everything lands on rtsp://. rtspll:// was the old player selector and is still
+    // accepted so cameras stored by earlier builds keep working.
     val candidate =
             when {
-                trimmed.startsWith("rtspll://", ignoreCase = true) -> trimmed
-                trimmed.startsWith("rtsp://", ignoreCase = true) ->
-                        "rtspll://" + trimmed.substring(7)
+                trimmed.startsWith("rtsp://", ignoreCase = true) -> trimmed
+                trimmed.startsWith("rtspll://", ignoreCase = true) ->
+                        "rtsp://" + trimmed.substring(9)
                 trimmed.contains("://") -> return null
-                else -> "rtspll://$trimmed"
+                else -> "rtsp://$trimmed"
             }
 
-    return if (parseRtspLowLatencyUrl(candidate) != null) candidate else null
+    return if (parseRtspUrl(candidate) != null) candidate else null
 }
 
 private val Background = Color(0xFF111216)
@@ -1367,7 +1368,7 @@ private fun CameraSettingsRow(
                     modifier = Modifier.fillMaxWidth(),
             )
             Text(
-                    camera.url?.removePrefix("rtspll://") ?: "No address",
+                    camera.url?.substringAfter("://") ?: "No address",
                     color = SettingsSecondary,
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace,
@@ -1645,7 +1646,7 @@ private fun RtspUdpCameraPreview(
         videoTransform: VideoTransform = VideoTransform(),
         onPlayingChange: (Boolean) -> Unit = {},
 ) {
-    val endpoint = remember(streamUrl) { parseRtspLowLatencyUrl(streamUrl) } ?: return
+    val endpoint = remember(streamUrl) { parseRtspUrl(streamUrl) } ?: return
 
     DirectSurfacePreview(
             streamUrl = streamUrl,

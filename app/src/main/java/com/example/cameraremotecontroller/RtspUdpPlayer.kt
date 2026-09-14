@@ -31,8 +31,11 @@ internal data class RtspEndpoint(
         get() = "rtsp://$host:$port$path"
 }
 
-internal fun parseRtspLowLatencyUrl(value: String): RtspEndpoint? {
-    val match = RTSP_LL_URL.matchEntire(value.trim()) ?: return null
+
+
+
+internal fun parseRtspUrl(value: String): RtspEndpoint? {
+    val match = RTSP_URL.matchEntire(value.trim()) ?: return null
     val host = match.groupValues[1]
     val port = match.groupValues[2].toIntOrNull() ?: RTSP_DEFAULT_PORT
     val path = match.groupValues[3].ifEmpty { "/" }
@@ -627,4 +630,6 @@ internal class RtspUdpPlayer(
 
 private const val RTSP_DEFAULT_PORT = 554
 
-private val RTSP_LL_URL = Regex("^rtspll://([^/:\\s]+)(?::(\\d+))?(/.*)?$", RegexOption.IGNORE_CASE)
+// rtspll:// was the scheme that selected this player while libVLC still existed.
+// Still matched so cameras stored by earlier builds keep working.
+private val RTSP_URL = Regex("^rtsp(?:ll)?://([^/:\\s]+)(?::(\\d+))?(/.*)?$", RegexOption.IGNORE_CASE)

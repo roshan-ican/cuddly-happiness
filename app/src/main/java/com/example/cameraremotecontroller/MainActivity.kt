@@ -709,6 +709,17 @@ fun ControllerDashboard() {
             RcControlsLayer(
                     showMonitor = showRcChannels,
                     onDismissMonitor = { showRcChannels = false },
+                    pipActive = floatingId != null,
+                    onPipPreset = {
+                        val pipCamera = pageCameras.firstOrNull { it.id != primaryId }
+                        if (pipCamera != null) {
+                            floatingId = pipCamera.id
+                            stowedLeft = null
+                            floatWasMain = false
+                            floatX = screenW.value - floatW.value - margin.value
+                            floatY = margin.value + 44f
+                        }
+                    },
                     onScreenPreset = { value ->
                         val next =
                                 when {
@@ -1164,6 +1175,8 @@ private fun RcControlsLayer(
         showMonitor: Boolean,
         onDismissMonitor: () -> Unit,
         onScreenPreset: (Int) -> Unit,
+        pipActive: Boolean,
+        onPipPreset: () -> Unit,
         modifier: Modifier = Modifier,
 ) {
     var state by remember { mutableStateOf(SiyiRcChannelState()) }
@@ -1203,13 +1216,25 @@ private fun RcControlsLayer(
                 mapping = DEFAULT_RC_CHANNEL_MAP,
                 modifier = Modifier.align(Alignment.BottomCenter),
         )
-        Row(
+        Column(
                 modifier = Modifier.align(Alignment.TopCenter).padding(top = 11.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            RC_TOP_CONTROLS.forEach { control ->
-                RcControlTile(control, DEFAULT_RC_CHANNEL_MAP.channelValue(control, state.channels))
+            listOf(RC_TOP_STATUS_CONTROLS, RC_TOP_ACTION_CONTROLS).forEach { controls ->
+                Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    controls.forEach { control ->
+                        RcControlTile(
+                                control,
+                                DEFAULT_RC_CHANNEL_MAP.channelValue(control, state.channels),
+                                pipActive = pipActive,
+                                onPipPreset = onPipPreset,
+                        )
+                    }
+                }
             }
         }
     }
@@ -1224,7 +1249,14 @@ private fun RcControlsLayer(
 }
 
 @Composable
-private fun RcSwitchIndicator(label: String, value: Int, positionLabels: List<String>) {
+private fun RcSwitchIndicator(
+        label: String,
+        value: Int,
+        positionLabels: List<String>,
+        extraLabel: String? = null,
+        extraActive: Boolean = false,
+        onExtraClick: (() -> Unit)? = null,
+) {
     val position =
             when {
                 value == 0 -> -1
@@ -1250,13 +1282,22 @@ private fun RcSwitchIndicator(label: String, value: Int, positionLabels: List<St
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.padding(horizontal = 5.dp),
         )
-        positionLabels.forEachIndexed { index, text ->
-            val active = index == position
+        val labels = if (extraLabel == null) positionLabels else positionLabels + extraLabel
+        labels.forEachIndexed { index, text ->
+            val isExtra = index == positionLabels.size
+            val active = if (isExtra) extraActive else !extraActive && index == position
             Box(
                     modifier =
                             Modifier.fillMaxHeight()
                                     .clip(RoundedCornerShape(6.dp))
                                     .background(if (active) Green.copy(alpha = 0.9f) else Color.Transparent)
+                                    .then(
+                                            if (isExtra && onExtraClick != null) {
+                                                Modifier.pressable(onClick = onExtraClick)
+                                            } else {
+                                                Modifier
+                                            }
+                                    )
                                     .padding(horizontal = 7.dp),
                     contentAlignment = Alignment.Center,
             ) {
@@ -1272,12 +1313,12 @@ private fun RcSwitchIndicator(label: String, value: Int, positionLabels: List<St
 }
 
 @Composable
-private fun RcDialIndicator(label: String, value: Int) {
+private fun RcDialIndicator(label: String, value: Int, width: Dp = 96.dp) {
     val normalized = if (value == 0) 0f else ((value - 1050) / 900f).coerceIn(0f, 1f)
     val shape = RoundedCornerShape(8.dp)
     Row(
             modifier =
-                    Modifier.width(96.dp)
+                    Modifier.width(width)
                             .height(28.dp)
                             .clip(shape)
                             .background(Color.Black.copy(alpha = 0.52f))
@@ -1318,11 +1359,11 @@ private fun RcDialIndicator(label: String, value: Int) {
 }
 
 @Composable
-private fun RcButtonIndicator(label: String, value: Int) {
+private fun RcButtonIndicator(label: String, value: Int, width: Dp = 58.dp) {
     val active = value >= 1750
     Row(
             modifier =
-                    Modifier.width(58.dp)
+                    Modifier.width(width)
                             .height(28.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .background(
@@ -1383,23 +1424,57 @@ private fun RcControlTiles(
     }
 }
 
-private val RC_TOP_CONTROLS =
+private val RC_TOP_STATUS_CONTROLS =
         listOf(
                 RcControl.FLIGHT,
                 RcControl.SA,
                 RcControl.SB,
-                RcControl.S1,
-                RcControl.S2,
-                RcControl.S4,
                 RcControl.RD,
         )
 
+private val RC_TOP_ACTION_CONTROLS =
+        listOf(
+                RcControl.S1,
+                RcControl.S2,
+                RcControl.S4,
+        )
+
+private val RC_TOP_CONTROLS = RC_TOP_STATUS_CONTROLS + RC_TOP_ACTION_CONTROLS
+
+private fun RcControl.operatorLabel(): String =
+        ROVER_WS_PROFILE.firstOrNull { it.control == this }?.function?.uppercase() ?: label
+
 @Composable
-private fun RcControlTile(control: RcControl, value: Int) {
+private fun RcControlTile(
+        control: RcControl,
+        value: Int,
+        pipActive: Boolean = false,
+        onPipPreset: () -> Unit = {},
+) {
+    val label = control.operatorLabel()
     when (control.kind) {
-        RcControlKind.SWITCH -> RcSwitchIndicator(control.label, value, control.positionLabels())
-        RcControlKind.DIAL -> RcDialIndicator(control.label, value)
-        else -> RcButtonIndicator(control.label, value)
+        RcControlKind.SWITCH ->
+                RcSwitchIndicator(
+                        label = label,
+                        value = value,
+                        positionLabels = control.positionLabels(),
+                        extraLabel = if (control == RcControl.FLIGHT) "PIP" else null,
+                        extraActive = control == RcControl.FLIGHT && pipActive,
+                        onExtraClick = if (control == RcControl.FLIGHT) onPipPreset else null,
+                )
+        RcControlKind.DIAL ->
+                RcDialIndicator(
+                        label = label,
+                        value = value,
+                        width =
+                                when (control) {
+                                    RcControl.LK -> 170.dp
+                                    RcControl.RK -> 150.dp
+                                    RcControl.RD -> 160.dp
+                                    else -> 96.dp
+                                },
+                )
+        else -> RcButtonIndicator(label, value, width = 112.dp)
     }
 }
 
@@ -1417,7 +1492,7 @@ private fun RcJoystickOverlay(
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Bottom) {
             RcJoystickIndicator(
-                    "MAIN L",
+                    "ROVER DRIVE",
                     mapping.channelValue(RcControl.J4, channels),
                     mapping.channelValue(RcControl.J3, channels),
                     76.dp,
@@ -1427,7 +1502,7 @@ private fun RcJoystickOverlay(
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Bottom) {
             RcControlTiles(state, mapping, RcSide.RIGHT)
             RcJoystickIndicator(
-                    "MAIN R",
+                    "WS AIM",
                     mapping.channelValue(RcControl.J1, channels),
                     mapping.channelValue(RcControl.J2, channels),
                     76.dp,

@@ -149,4 +149,113 @@ internal fun parseSiyiRcChannels(data: ByteArray, length: Int): List<Int>? {
     }
 }
 
+internal data class SiyiRcMapping(val type: Int, val entityId: Int)
+
+internal data class SiyiRcMapApplyResult(
+    val before: List<SiyiRcMapping>,
+    val after: List<SiyiRcMapping>?,
+    val error: String? = null,
+) {
+    val verified: Boolean get() = error == null && after != null
+}
+
+internal fun roverWsHardwareMap(existing: List<SiyiRcMapping>): List<SiyiRcMapping> {
+    require(existing.size == RC_CHANNEL_COUNT)
+    val fl = existing[4]
+    return listOf(
+        SiyiRcMapping(0, 0), SiyiRcMapping(0, 1), SiyiRcMapping(0, 2), SiyiRcMapping(0, 3),
+        fl,
+        SiyiRcMapping(5, 0), SiyiRcMapping(5, 1), SiyiRcMapping(5, 2), SiyiRcMapping(0, 11),
+        SiyiRcMapping(5, 4), SiyiRcMapping(5, 5), SiyiRcMapping(1, 0), SiyiRcMapping(1, 1),
+        SiyiRcMapping(1, 3), SiyiRcMapping(0, 8), SiyiRcMapping(0, 9),
+    )
+}
+
+internal fun buildSiyiPacket(command: Int, payload: ByteArray = byteArrayOf()): ByteArray {
+    val packet = ByteArray(10 + payload.size)
+    packet[0] = 0x55
+    packet[1] = 0x66
+    packet[2] = 0x01
+    packet[3] = (payload.size and 0xFF).toByte()
+    packet[4] = ((payload.size shr 8) and 0xFF).toByte()
+    packet[7] = command.toByte()
+    payload.copyInto(packet, destinationOffset = 8)
+    val crc = siyiCrc16(packet, packet.size - 2)
+    packet[packet.size - 2] = (crc and 0xFF).toByte()
+    packet[packet.size - 1] = (crc shr 8).toByte()
+    return packet
+}
+
+internal fun parseSiyiMappingResponse(data: ByteArray, length: Int): List<SiyiRcMapping>? {
+    val payload = parseSiyiResponse(data, length, 0x48) ?: return null
+    return parseSiyiMappingPayload(payload)
+}
+
+private fun parseSiyiMappingPayload(payload: ByteArray): List<SiyiRcMapping>? {
+    if (payload.size != RC_CHANNEL_COUNT * 2) return null
+    return payload.asList().chunked(2).map { SiyiRcMapping(it[0].toInt() and 0xFF, it[1].toInt() and 0xFF) }
+}
+
+private fun parseSiyiResponse(data: ByteArray, length: Int, command: Int): ByteArray? {
+    if (length < 10 || data[0] != 0x55.toByte() || data[1] != 0x66.toByte() || (data[7].toInt() and 0xFF) != command) return null
+    val payloadLength = (data[3].toInt() and 0xFF) or ((data[4].toInt() and 0xFF) shl 8)
+    if (length != payloadLength + 10 || siyiCrc16(data, length - 2) != ((data[length - 2].toInt() and 0xFF) or ((data[length - 1].toInt() and 0xFF) shl 8))) return null
+    return data.copyOfRange(8, 8 + payloadLength)
+}
+
+private fun siyiCrc16(data: ByteArray, count: Int): Int {
+    var crc = 0
+    repeat(count) { index ->
+        crc = crc xor ((data[index].toInt() and 0xFF) shl 8)
+        repeat(8) { crc = if (crc and 0x8000 != 0) (crc shl 1) xor 0x1021 else crc shl 1 }
+        crc = crc and 0xFFFF
+    }
+    return crc
+}
+
+internal class SiyiRcMappingClient {
+    fun applyRoverWsProfile(): SiyiRcMapApplyResult {
+        DatagramSocket().use { socket ->
+            socket.soTimeout = 800
+            val before = readAll(socket) ?: return SiyiRcMapApplyResult(emptyList(), after = null, error = "Unable to read controller mapping")
+            val expected = roverWsHardwareMap(before)
+            expected.forEachIndexed { index, mapping ->
+                val channel = index + 1
+                val acknowledgement = exchange(socket, 0x4A, byteArrayOf(channel.toByte(), mapping.type.toByte(), mapping.entityId.toByte()))
+                if (acknowledgement == null || acknowledgement.size != 2 || acknowledgement[0].toInt() and 0xFF != channel || acknowledgement[1] != 1.toByte()) {
+                    return SiyiRcMapApplyResult(before, after = null, error = "Controller rejected CH$channel")
+                }
+            }
+            val after = readAll(socket)
+            return if (after == expected) SiyiRcMapApplyResult(before, after) else SiyiRcMapApplyResult(before, after, "Controller read-back does not match the Rover / WS profile")
+        }
+    }
+
+    private fun readAll(socket: DatagramSocket): List<SiyiRcMapping>? = exchange(socket, 0x48)?.let(::parseSiyiMappingPayload)
+
+    private fun exchange(socket: DatagramSocket, command: Int, payload: ByteArray = byteArrayOf()): ByteArray? {
+        val remote = InetSocketAddress(InetAddress.getByName(SIYI_RC_HOST), SIYI_RC_PORT)
+        val request = buildSiyiPacket(command, payload)
+        repeat(3) {
+            socket.send(DatagramPacket(request, request.size, remote))
+            repeat(2) {
+                val data = ByteArray(256)
+                try {
+                    val response = DatagramPacket(data, data.size)
+                    socket.receive(response)
+                    parseSiyiResponse(data, response.length, command)?.let { return it }
+                } catch (_: SocketTimeoutException) {
+                    return@repeat
+                }
+            }
+        }
+        return null
+    }
+
+    private companion object {
+        const val SIYI_RC_HOST = "192.168.144.20"
+        const val SIYI_RC_PORT = 19856
+    }
+}
+
 private const val CHANNEL_COUNT = 16

@@ -709,6 +709,20 @@ fun ControllerDashboard() {
             RcControlsLayer(
                     showMonitor = showRcChannels,
                     onDismissMonitor = { showRcChannels = false },
+                    onScreenPreset = { value ->
+                        val next =
+                                when {
+                                    value < 1250 -> CameraLayoutMode.SPLIT
+                                    value > 1750 -> CameraLayoutMode.FOCUS_LEFT
+                                    else -> CameraLayoutMode.AUTO_GRID
+                                }
+                        if (layoutMode != next) {
+                            layoutMode = next
+                            floatingId = null
+                            stowedLeft = null
+                            prefs.edit().putString(PREFS_KEY_LAYOUT, next.name).apply()
+                        }
+                    },
                     modifier = Modifier.fillMaxSize().zIndex(4f),
             )
             if (pageCount > 1) {
@@ -1149,13 +1163,21 @@ private fun RcChannelsButton(modifier: Modifier, onClick: () -> Unit) {
 private fun RcControlsLayer(
         showMonitor: Boolean,
         onDismissMonitor: () -> Unit,
+        onScreenPreset: (Int) -> Unit,
         modifier: Modifier = Modifier,
 ) {
     var state by remember { mutableStateOf(SiyiRcChannelState()) }
     val client = remember { SiyiRcChannelClient { state = it } }
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
-    var mapping by remember { mutableStateOf(prefs.loadRcChannelMap()) }
+    var lastPreset by remember { mutableStateOf<Int?>(null) }
+
+    LaunchedEffect(state.channels.getOrElse(4) { 0 }) {
+        val preset = state.channels.getOrElse(4) { 0 }
+        if (preset != 0 && preset != lastPreset) {
+            lastPreset = preset
+            onScreenPreset(preset)
+        }
+    }
 
     DisposableEffect(client, context) {
         val lifecycle = (context as ComponentActivity).lifecycle
@@ -1176,32 +1198,33 @@ private fun RcControlsLayer(
     }
 
     Box(modifier = modifier) {
-        RcJoystickOverlay(state = state, mapping = mapping, modifier = Modifier.align(Alignment.BottomCenter))
+        RcJoystickOverlay(
+                state = state,
+                mapping = DEFAULT_RC_CHANNEL_MAP,
+                modifier = Modifier.align(Alignment.BottomCenter),
+        )
         Row(
                 modifier = Modifier.align(Alignment.TopCenter).padding(top = 11.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
         ) {
-            RC_TOP_CONTROLS.filter { it in mapping || it == RcControl.S1 || it == RcControl.S2 }.forEach { control ->
-                RcControlTile(control, mapping.channelValue(control, state.channels))
+            RC_TOP_CONTROLS.forEach { control ->
+                RcControlTile(control, DEFAULT_RC_CHANNEL_MAP.channelValue(control, state.channels))
             }
         }
     }
+
     if (showMonitor) {
         RcMappingDialog(
                 state = state,
-                mapping = mapping,
-                onMappingChange = {
-                    mapping = it
-                    prefs.saveRcChannelMap(it)
-                },
+                onApplyProfile = { SiyiRcMappingClient().applyRoverWsProfile() },
                 onDismiss = onDismissMonitor,
         )
     }
 }
 
 @Composable
-private fun RcSwitchIndicator(label: String, value: Int) {
+private fun RcSwitchIndicator(label: String, value: Int, positionLabels: List<String>) {
     val position =
             when {
                 value == 0 -> -1
@@ -1227,7 +1250,7 @@ private fun RcSwitchIndicator(label: String, value: Int) {
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.padding(horizontal = 5.dp),
         )
-        listOf("LOW", "MID", "HIGH").forEachIndexed { index, text ->
+        positionLabels.forEachIndexed { index, text ->
             val active = index == position
             Box(
                     modifier =
@@ -1360,12 +1383,21 @@ private fun RcControlTiles(
     }
 }
 
-private val RC_TOP_CONTROLS = listOf(RcControl.SA, RcControl.LD, RcControl.S1, RcControl.S2, RcControl.RD, RcControl.SB)
+private val RC_TOP_CONTROLS =
+        listOf(
+                RcControl.FLIGHT,
+                RcControl.SA,
+                RcControl.SB,
+                RcControl.S1,
+                RcControl.S2,
+                RcControl.S4,
+                RcControl.RD,
+        )
 
 @Composable
 private fun RcControlTile(control: RcControl, value: Int) {
     when (control.kind) {
-        RcControlKind.SWITCH -> RcSwitchIndicator(control.label, value)
+        RcControlKind.SWITCH -> RcSwitchIndicator(control.label, value, control.positionLabels())
         RcControlKind.DIAL -> RcDialIndicator(control.label, value)
         else -> RcButtonIndicator(control.label, value)
     }

@@ -33,7 +33,7 @@ internal enum class RcControl(
     SF("SF", RcControlKind.SWITCH, RcSide.RIGHT, 0.93f, 0.32f),
     RK("RK", RcControlKind.DIAL, RcSide.RIGHT, 0.8f, 0.32f),
     RD("RD", RcControlKind.DIAL, RcSide.RIGHT, 0.65f, 0.13f),
-    FLIGHT("FLT", RcControlKind.SWITCH, RcSide.LEFT),
+    FLIGHT("Fl", RcControlKind.SWITCH, RcSide.LEFT),
     S1("S1", RcControlKind.BUTTON, RcSide.LEFT),
     S2("S2", RcControlKind.BUTTON, RcSide.LEFT),
     S3("S3", RcControlKind.BUTTON, RcSide.RIGHT),
@@ -63,16 +63,49 @@ internal val DEFAULT_RC_CHANNEL_MAP: List<RcControl?> =
         RcControl.FLIGHT,
         RcControl.SA,
         RcControl.SB,
-        RcControl.LK,
-        RcControl.LD,
-        RcControl.RD,
         RcControl.SC,
-        RcControl.SD,
+        RcControl.RD,
         RcControl.SE,
         RcControl.SF,
         RcControl.S1,
+        RcControl.S2,
+        RcControl.S4,
+        RcControl.LK,
         RcControl.RK,
     )
+
+internal enum class RcProfileDisplayKind { PROPORTIONAL, SWITCH, BUTTON }
+
+internal data class RcProfileChannel(
+    val channel: Int,
+    val control: RcControl,
+    val function: String,
+    val displayKind: RcProfileDisplayKind,
+    val positionLabels: List<String> = emptyList(),
+)
+
+internal val ROVER_WS_PROFILE = listOf(
+    RcProfileChannel(1, RcControl.J1, "WS Azimuth", RcProfileDisplayKind.PROPORTIONAL),
+    RcProfileChannel(2, RcControl.J2, "WS Elevation", RcProfileDisplayKind.PROPORTIONAL),
+    RcProfileChannel(3, RcControl.J3, "Rover Throttle", RcProfileDisplayKind.PROPORTIONAL),
+    RcProfileChannel(4, RcControl.J4, "Rover Steering", RcProfileDisplayKind.PROPORTIONAL),
+    RcProfileChannel(5, RcControl.FLIGHT, "Screen Preset", RcProfileDisplayKind.SWITCH, listOf("SPLIT", "GRID", "SIDE")),
+    RcProfileChannel(6, RcControl.SA, "Rover Brakes", RcProfileDisplayKind.SWITCH, listOf("RELEASE", "HOLD", "LOCK")),
+    RcProfileChannel(7, RcControl.SB, "WS Brakes", RcProfileDisplayKind.SWITCH, listOf("RELEASE", "HOLD", "LOCK")),
+    RcProfileChannel(8, RcControl.SC, "Rover Lights", RcProfileDisplayKind.SWITCH, listOf("OFF", "LOW", "HIGH")),
+    RcProfileChannel(9, RcControl.RD, "WS Camera Zoom", RcProfileDisplayKind.PROPORTIONAL),
+    RcProfileChannel(10, RcControl.SE, "WS Firing Mode", RcProfileDisplayKind.SWITCH, listOf("SAFE", "SINGLE", "AUTO")),
+    RcProfileChannel(11, RcControl.SF, "WS Tracking Mode", RcProfileDisplayKind.SWITCH, listOf("OFF", "MANUAL", "AUTO")),
+    RcProfileChannel(12, RcControl.S1, "WS Trigger 1", RcProfileDisplayKind.BUTTON),
+    RcProfileChannel(13, RcControl.S2, "WS Trigger 2", RcProfileDisplayKind.BUTTON),
+    RcProfileChannel(14, RcControl.S4, "WS Cocking", RcProfileDisplayKind.BUTTON),
+    RcProfileChannel(15, RcControl.LK, "Rover Speed Range", RcProfileDisplayKind.PROPORTIONAL),
+    RcProfileChannel(16, RcControl.RK, "WS Speed Range", RcProfileDisplayKind.PROPORTIONAL),
+)
+
+internal fun RcControl.positionLabels(): List<String> =
+    ROVER_WS_PROFILE.firstOrNull { it.control == this }?.positionLabels?.takeIf { it.size == 3 }
+        ?: listOf("LOW", "MID", "HIGH")
 
 internal fun List<RcControl?>.channelValue(
     control: RcControl,
